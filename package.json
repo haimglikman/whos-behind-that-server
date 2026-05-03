@@ -1,0 +1,20 @@
+{
+  "name": "whos-behind-that-server",
+  "version": "1.4.0",
+  "description": "Proxy server for Who's Behind That? — fetches social media post text and runs Claude AI scoring",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2"
+  }
+}
