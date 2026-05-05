@@ -405,6 +405,7 @@ Respond ONLY with valid JSON, no preamble, no markdown:
 }
 
 
+app.listen(PORT, () => {
   console.log(`Who's Behind That? server running on port ${PORT}`);
   if (!ANTHROPIC_KEY) console.warn('WARNING: ANTHROPIC_API_KEY not set — /analyze endpoints will fail');
 });
