@@ -5,32 +5,24 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.6.3 — Scoring consistency fix:
-//           - Entities now scored in batches of 10 (not all 50 at once)
-//             so each entity gets full attention from Claude.
-//           - temperature: 0 on all Claude calls for deterministic output.
-//           - Threshold lowered to 60% for scoring (frontend still shows 85%+)
-//             so reasoning is available for moderate matches too.
-//           - Batch calls run in parallel via Promise.all for speed.
+// v1.3.0 — Batched scoring (10 entities per call), temperature: 0 for
+//           deterministic output, internal threshold lowered to 60%.
 //
-// v1.6.0 — Added /research-actor endpoint: Claude OSINT lookup for social media
-//           actors, returns name, bio, location, known handles. Cached client-side.
+// v1.2.2 — Added SERVER_VERSION constant and changelog comment block.
 //
-// v1.4.0 — Rewrote scoring prompt to "narrative alignment" framing. Added
-//           "missing" field per entity match: what the post conspicuously omits.
+// v1.2.1 — Fixed missing app.listen() line causing Render deploy failure.
 //
-// v1.3.0 — Updated Claude scoring weights: interest 55%, MO 35%, narrative 10%.
-//           Claude now scores interest independently of public claims.
+// v1.2.0 — Added /research-actor endpoint (Claude OSINT actor lookup).
 //
-// v1.2.0 — Added /fetch-and-analyze, /analyze, /fetch-post endpoints.
-//           Claude scoring engine with per-entity narrative/interest/MO scores.
-//           X (oEmbed), Facebook, Instagram fetchers with Open Graph fallback.
+// v1.1.1 — Updated scoring weights: interest 55%, MO 35%, narrative 10%.
 //
-// v1.1.0 — Initial deployment. Express server, CORS, health check,
-//           ANTHROPIC_API_KEY env var support.
+// v1.1.0 — Scoring prompt rewritten to narrative alignment framing;
+//           added "missing" context field per entity match.
+//
+// v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.6.3';
+const SERVER_VERSION = '1.3.0';
 
 import express from 'express';
 import cors from 'cors';
