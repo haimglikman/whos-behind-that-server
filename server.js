@@ -338,7 +338,73 @@ function stripHtml(html) {
   return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-app.listen(PORT, () => {
+// ─────────────────────────────────────────────
+// POST /research-actor
+// Body: { handle, url }
+// Returns: { actor: { name, bio, location, handles } }
+// ─────────────────────────────────────────────
+app.post('/research-actor', async (req, res) => {
+  const { handle, url } = req.body;
+  if (!handle) return res.status(400).json({ error: 'handle is required' });
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
+
+  try {
+    const actor = await researchActorWithClaude(handle, url);
+    res.json({ success: true, actor });
+  } catch (err) {
+    console.error('research-actor error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+async function researchActorWithClaude(handle, url) {
+  const prompt = `You are an open-source intelligence (OSINT) researcher. Research the following social media account and provide a factual profile based on publicly available information.
+
+Account handle: @${handle}
+${url ? `Profile URL context: ${url}` : ''}
+
+Provide the following:
+1. name: The real name of the person or organization behind this account (if publicly known). If unknown, use the handle.
+2. bio: A factual 2-paragraph summary of who this actor is — their background, what they are known for, their political or ideological stance, and any notable activities or affiliations. If this is an anonymous or low-profile account with no public information, state that clearly and briefly.
+3. location: The country or city they are known to be based in (if publicly known). Write "Unknown" if not established.
+4. handles: An array of known social media handles, websites, or other online presence associated with this actor. Include platform prefix e.g. "X: @handle", "Instagram: @handle", "Website: domain.com". Include only verified or highly likely matches.
+
+Be factual and neutral. Do not speculate beyond what is publicly known. If this is a clearly anonymous account or a bot farm with no traceable identity, say so explicitly in the bio.
+
+Respond ONLY with valid JSON, no preamble, no markdown:
+{
+  "name": "...",
+  "bio": "...",
+  "location": "...",
+  "handles": ["X: @handle", "Website: example.com"]
+}`;
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 800,
+      messages: [{ role: 'user', content: prompt }]
+    })
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error('Claude API error: ' + (err.error?.message || response.status));
+  }
+
+  const data = await response.json();
+  const raw = data.content.map(c => c.text || '').join('').trim();
+  const clean = raw.replace(/```json|```/g, '').trim();
+  return JSON.parse(clean);
+}
+
+
   console.log(`Who's Behind That? server running on port ${PORT}`);
   if (!ANTHROPIC_KEY) console.warn('WARNING: ANTHROPIC_API_KEY not set — /analyze endpoints will fail');
 });
