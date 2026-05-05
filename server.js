@@ -1,6 +1,36 @@
 // Who's Behind That? — Proxy Server
 // Handles: post text fetching + Claude AI scoring
 // Deploy to Render.com (free tier)
+//
+// ─────────────────────────────────────────────
+// CHANGELOG
+// ─────────────────────────────────────────────
+// v1.6.3 — Scoring consistency fix:
+//           - Entities now scored in batches of 10 (not all 50 at once)
+//             so each entity gets full attention from Claude.
+//           - temperature: 0 on all Claude calls for deterministic output.
+//           - Threshold lowered to 60% for scoring (frontend still shows 85%+)
+//             so reasoning is available for moderate matches too.
+//           - Batch calls run in parallel via Promise.all for speed.
+//
+// v1.6.0 — Added /research-actor endpoint: Claude OSINT lookup for social media
+//           actors, returns name, bio, location, known handles. Cached client-side.
+//
+// v1.4.0 — Rewrote scoring prompt to "narrative alignment" framing. Added
+//           "missing" field per entity match: what the post conspicuously omits.
+//
+// v1.3.0 — Updated Claude scoring weights: interest 55%, MO 35%, narrative 10%.
+//           Claude now scores interest independently of public claims.
+//
+// v1.2.0 — Added /fetch-and-analyze, /analyze, /fetch-post endpoints.
+//           Claude scoring engine with per-entity narrative/interest/MO scores.
+//           X (oEmbed), Facebook, Instagram fetchers with Open Graph fallback.
+//
+// v1.1.0 — Initial deployment. Express server, CORS, health check,
+//           ANTHROPIC_API_KEY env var support.
+// ─────────────────────────────────────────────
+
+const SERVER_VERSION = '1.6.3';
 
 import express from 'express';
 import cors from 'cors';
@@ -32,7 +62,7 @@ app.use(express.json({ limit: '1mb' }));
 
 // ── Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: "Who's Behind That? API", version: '1.3' });
+  res.json({ status: 'ok', service: "Who's Behind That? API", version: SERVER_VERSION });
 });
 
 // ─────────────────────────────────────────────
@@ -243,48 +273,86 @@ async function scrapeOpenGraph(url, platform) {
 
 // ─────────────────────────────────────────────
 // CLAUDE SCORING ENGINE
+// Scores entities in batches of 10 for consistency.
+// temperature: 0 for deterministic output.
+// Returns all entities >= 60% so frontend can show
+// reasoning even for moderate matches.
 // ─────────────────────────────────────────────
+const BATCH_SIZE = 10;
+
 async function scoreWithClaude(postText, entities) {
+  // Split entities into batches of BATCH_SIZE
+  const batches = [];
+  for (let i = 0; i < entities.length; i += BATCH_SIZE) {
+    batches.push(entities.slice(i, i + BATCH_SIZE));
+  }
+
+  // Score each batch in parallel
+  const batchResults = await Promise.all(batches.map(batch => scoreBatch(postText, batch)));
+
+  // Flatten and merge all matches, deduplicate by id
+  const allMatches = [];
+  let text_ai_score = 5;
+  let text_ai_reason = '';
+
+  for (const result of batchResults) {
+    if (result.text_ai_score) text_ai_score = result.text_ai_score;
+    if (result.text_ai_reason) text_ai_reason = result.text_ai_reason;
+    for (const match of (result.matches || [])) {
+      if (!allMatches.find(m => m.id === match.id)) {
+        allMatches.push(match);
+      }
+    }
+  }
+
+  // Sort by combined score descending
+  allMatches.sort((a, b) => b.pct - a.pct);
+
+  return { text_ai_score, text_ai_reason, matches: allMatches };
+}
+
+async function scoreBatch(postText, entities) {
   const entitySummaries = entities.map(e =>
     `ID:${e.id} NAME:${e.name} TYPE:${e.type}\nNARRATIVE: ${(e.narrative||'').slice(0,300)}\nINTEREST: ${(e.interest||'').slice(0,300)}\nMO: ${(e.mo||'').slice(0,300)}`
   ).join('\n---\n');
 
-  const prompt = `You are a senior analyst specializing in geopolitical influence operations, information warfare, and social media manipulation. Your task is to determine whose agenda a social media post serves, and crucially — what context it leaves out.
+  const prompt = `You are a senior analyst specializing in geopolitical influence operations, information warfare, and social media manipulation. Your task is to determine whose agenda a social media post serves, and what context it leaves out.
 
 CORE PHILOSOPHY:
-The primary concern is not whether a post contains outright lies, but whether it tells only half the story to serve a specific agenda. A post can be factually accurate and still be pure propaganda if it selectively presents only the facts that serve one side. Your job is to identify: (1) whose hidden interest this post serves, (2) how it was constructed to serve that interest, and (3) what relevant context is conspicuously absent.
+The primary concern is not whether a post contains outright lies, but whether it tells only half the story to serve a specific agenda. A post can be factually accurate and still be pure propaganda if it selectively presents only the facts that serve one side. Identify: (1) whose hidden interest this post serves, (2) how it was constructed to serve that interest, and (3) what relevant context is conspicuously absent.
 
 SOCIAL MEDIA POST TEXT:
 "${postText}"
 
-ENTITY DATABASE:
+ENTITY DATABASE (score ALL of these — do not skip any):
 ${entitySummaries}
 
 SCORING INSTRUCTIONS:
-For each entity, independently assess three dimensions:
+For EACH entity above, assess three dimensions:
 
 1. interest_score (0-100) — MOST IMPORTANT (weight: 55%)
-   Ask: "Would spreading this post advance this entity's HIDDEN strategic interest?"
-   High score = the post materially benefits their covert goals.
+   "Would spreading this post advance this entity's HIDDEN strategic interest?"
    Score independently of whether the entity publicly claims to support the cause.
 
 2. mo_score (0-100) — IMPORTANT (weight: 35%)
-   Ask: "Does the construction of this post match this entity's known manipulation playbook?"
-   High score = post uses this entity's documented tactics (framing, vocabulary, selective omissions, emotional triggers).
+   "Does the construction of this post match this entity's known manipulation playbook?"
 
 3. narrative_score (0-100) — WEAK SIGNAL (weight: 10%)
-   Ask: "Does the post's surface content echo this entity's official public statements?"
-   Weight lightly — innocent alignment is common.
+   "Does the post's surface content echo this entity's official public statements?"
 
 Compute: combined_score = (interest_score * 0.55) + (mo_score * 0.35) + (narrative_score * 0.10)
+Round to nearest integer.
 
-Only return entities where combined_score >= 85.
+IMPORTANT: Return ALL entities where combined_score >= 60 (not just 85+).
+The frontend will apply the 85% threshold for display — but return everything >= 60 so reasoning is available.
 
-For each qualifying entity provide:
-- "why": 2-3 sentences citing specific phrases, explaining which hidden interest is served and which MO tactics are present
-- "missing": 2-3 sentences describing what relevant facts, context, or counter-narrative this post conspicuously omits that would give a fuller picture. Focus on what the entity would NOT want the reader to know.
+For each entity with combined_score >= 60, provide:
+- "why": 2-3 sentences citing specific phrases or patterns, which hidden interest is served, which MO tactics are present
+- "missing": 2-3 sentences on what relevant context this post conspicuously omits
 
-Also assess:
+For entities with combined_score < 60, still include them with scores but "why" and "missing" can be empty strings.
+
+Also assess (only needed once — include in first batch response):
 - text_ai_score (1-10): probability the text was AI-generated
 - text_ai_reason: one sentence of evidence
 
@@ -315,7 +383,8 @@ Respond ONLY with valid JSON, no preamble, no markdown:
     },
     body: JSON.stringify({
       model: 'claude-sonnet-4-5',
-      max_tokens: 1500,
+      max_tokens: 2000,
+      temperature: 0,
       messages: [{ role: 'user', content: prompt }]
     })
   });
