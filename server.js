@@ -5,6 +5,10 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.3.1 — Fixed Instagram actor research: extract authorHandle from oEmbed
+//           author_url so the "research this actor" prompt appears after
+//           analyzing Instagram posts (handle not present in post URLs).
+//
 // v1.3.0 — Batched scoring (10 entities per call), temperature: 0 for
 //           deterministic output, internal threshold lowered to 60%.
 //
@@ -22,7 +26,7 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.3.0';
+const SERVER_VERSION = '1.3.1';
 
 import express from 'express';
 import cors from 'cors';
@@ -225,9 +229,13 @@ async function fetchFromInstagram(url) {
   }
 
   const data = await response.json();
+  // Extract handle from author_url e.g. https://www.instagram.com/username/
+  const handleMatch = (data.author_url || '').match(/instagram\.com\/([^\/\?]+)/i);
+  const authorHandle = handleMatch ? handleMatch[1] : (data.author_name || null);
   return {
     text: stripHtml(data.html || ''),
     author: data.author_name || null,
+    authorHandle: authorHandle,
     html: data.html,
     source: 'oembed'
   };
