@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v1.3.1 — bug fix (server) | Main file: v1.7.2
+- Fixed Instagram actor research: authorHandle now extracted from oEmbed author_url
+- Handle correctly passed to frontend so "research this actor" prompt appears
+
 ## v1.3.0
 **Main file: v1.6.2**
 - **Batched scoring:** Entities now scored in batches of 10 instead of all 50 at once — each entity gets full Claude attention, dramatically improving consistency.
