@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v1.4.1 — bug fix (server) | Main file: v1.8.1
+- alignment field now mandatory on every match — was being omitted causing all to show as primary
+- Added "criticism ≠ alignment" rule to prompt — post attacking Netanyahu no longer scores as Netanyahu-aligned
+
 ### v1.4.0 (server) | Main file: v1.8.0
 - Scoring prompt updated with primary/secondary alignment classification
 - Claude now distinguishes between entities a post was written for vs entities that indirectly benefit
