@@ -5,6 +5,11 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.4.1 — Fixed two scoring bugs: (1) "alignment" field now mandatory in
+//           prompt — Claude was omitting it causing all matches to show as
+//           primary. (2) Added explicit "criticism ≠ alignment" rule — a post
+//           attacking Netanyahu no longer incorrectly scores as Netanyahu-aligned.
+//
 // v1.4.0 — Added primary/secondary alignment distinction. Primary = entity
 //           the post was likely written to serve. Secondary = indirect
 //           collateral beneficiary. Both require 85%+ threshold.
@@ -31,7 +36,7 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.4.0';
+const SERVER_VERSION = '1.4.1';
 
 import express from 'express';
 import cors from 'cors';
@@ -356,7 +361,11 @@ After scoring, classify each match (combined_score >= 60) as either:
 - "primary": This entity is a DIRECT beneficiary — the post appears to have been written with this entity's agenda in mind, consciously or not. The post's framing, vocabulary, and emphasis serve this entity's interest in a direct, intentional-looking way.
 - "secondary": This entity is an INDIRECT or COLLATERAL beneficiary — the post was not necessarily written for them, but its spread still serves their interests as a side effect. Example: a post attacking Netanyahu's coalition serves Israeli opposition directly (primary), but also benefits Qatar by portraying Israel's government as unstable (secondary).
 
+CRITICAL RULE — CRITICISM IS NOT ALIGNMENT:
+If a post ATTACKS, CRITICIZES, or DELEGITIMIZES an entity, that entity scores LOW on primary alignment — being criticized does not serve your interest. A post mocking Netanyahu does NOT align with Netanyahu. A post exposing Hamas atrocities does NOT align with Hamas. Only score an entity high if spreading the post HELPS them.
+
 Maximum 3 primary matches, maximum 2 secondary matches. If a match qualifies for both, assign it to primary only.
+The "alignment" field is MANDATORY on every match — always set it to either "primary" or "secondary", never omit it or leave it blank.
 
 For each entity with combined_score >= 60, provide:
 - "alignment": "primary" or "secondary"
