@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v1.4.0 (server) | Main file: v1.8.0
+- Scoring prompt updated with primary/secondary alignment classification
+- Claude now distinguishes between entities a post was written for vs entities that indirectly benefit
+- Max 3 primary, 2 secondary enforced in prompt
+
 ### v1.3.1 — bug fix (server) | Main file: v1.7.2
 - Fixed Instagram actor research: authorHandle now extracted from oEmbed author_url
 - Handle correctly passed to frontend so "research this actor" prompt appears
