@@ -5,6 +5,11 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.4.0 — Added primary/secondary alignment distinction. Primary = entity
+//           the post was likely written to serve. Secondary = indirect
+//           collateral beneficiary. Both require 85%+ threshold.
+//           Max 3 primary, 2 secondary matches returned.
+//
 // v1.3.1 — Fixed Instagram actor research: extract authorHandle from oEmbed
 //           author_url so the "research this actor" prompt appears after
 //           analyzing Instagram posts (handle not present in post URLs).
@@ -26,7 +31,7 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.3.1';
+const SERVER_VERSION = '1.4.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -319,7 +324,7 @@ async function scoreBatch(postText, entities) {
   const prompt = `You are a senior analyst specializing in geopolitical influence operations, information warfare, and social media manipulation. Your task is to determine whose agenda a social media post serves, and what context it leaves out.
 
 CORE PHILOSOPHY:
-The primary concern is not whether a post contains outright lies, but whether it tells only half the story to serve a specific agenda. A post can be factually accurate and still be pure propaganda if it selectively presents only the facts that serve one side. Identify: (1) whose hidden interest this post serves, (2) how it was constructed to serve that interest, and (3) what relevant context is conspicuously absent.
+The primary concern is not whether a post contains outright lies, but whether it tells only half the story to serve a specific agenda. A post can be factually accurate and still be pure propaganda if it selectively presents only the facts that serve one side. Identify: (1) whose hidden interest this post serves directly, (2) who indirectly benefits from the post being spread, and (3) what relevant context is conspicuously absent.
 
 SOCIAL MEDIA POST TEXT:
 "${postText}"
@@ -343,14 +348,22 @@ For EACH entity above, assess three dimensions:
 Compute: combined_score = (interest_score * 0.55) + (mo_score * 0.35) + (narrative_score * 0.10)
 Round to nearest integer.
 
-IMPORTANT: Return ALL entities where combined_score >= 60 (not just 85+).
-The frontend will apply the 85% threshold for display — but return everything >= 60 so reasoning is available.
+IMPORTANT: Return ALL entities where combined_score >= 60.
+The frontend will apply the 85% threshold for display.
+
+PRIMARY vs SECONDARY ALIGNMENT:
+After scoring, classify each match (combined_score >= 60) as either:
+- "primary": This entity is a DIRECT beneficiary — the post appears to have been written with this entity's agenda in mind, consciously or not. The post's framing, vocabulary, and emphasis serve this entity's interest in a direct, intentional-looking way.
+- "secondary": This entity is an INDIRECT or COLLATERAL beneficiary — the post was not necessarily written for them, but its spread still serves their interests as a side effect. Example: a post attacking Netanyahu's coalition serves Israeli opposition directly (primary), but also benefits Qatar by portraying Israel's government as unstable (secondary).
+
+Maximum 3 primary matches, maximum 2 secondary matches. If a match qualifies for both, assign it to primary only.
 
 For each entity with combined_score >= 60, provide:
-- "why": 2-3 sentences citing specific phrases or patterns, which hidden interest is served, which MO tactics are present
+- "alignment": "primary" or "secondary"
+- "why": 2-3 sentences — for primary: which hidden interest is directly served and which MO tactics are present; for secondary: how the post's spread indirectly benefits this entity
 - "missing": 2-3 sentences on what relevant context this post conspicuously omits
 
-For entities with combined_score < 60, still include them with scores but "why" and "missing" can be empty strings.
+For entities with combined_score < 60, still include them with scores but "why", "missing", and "alignment" can be empty strings.
 
 Also assess (only needed once — include in first batch response):
 - text_ai_score (1-10): probability the text was AI-generated
@@ -368,6 +381,7 @@ Respond ONLY with valid JSON, no preamble, no markdown:
       "interest": 95,
       "mo": 88,
       "pct": 91,
+      "alignment": "primary",
       "why": "...",
       "missing": "..."
     }
