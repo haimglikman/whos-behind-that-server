@@ -5,6 +5,10 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.5.1 — Fixed PostgreSQL connection: better error handling and logging,
+//           test query on startup, db=null if connection fails so server
+//           still starts. Helps diagnose DATABASE_URL issues on Render.
+//
 // v1.5.0 — Shared history via PostgreSQL. New endpoints: /history/save,
 //           /history/list, /history/comment. Scan IDs in format
 //           WBT-{date}-{appVer}-{srvVer}-{random}. App + server version
@@ -42,7 +46,7 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.5.0';
+const SERVER_VERSION = '1.5.1';
 
 import express from 'express';
 import cors from 'cors';
@@ -56,12 +60,25 @@ const PORT = process.env.PORT || 3000;
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 
-// ── PostgreSQL connection pool
-// DATABASE_URL is set automatically by Render when you attach a PostgreSQL instance
-const db = process.env.DATABASE_URL ? new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-}) : null;
+// ── PostgreSQL connection
+// DATABASE_URL must be set in Render environment variables
+let db = null;
+if (process.env.DATABASE_URL) {
+  console.log('DATABASE_URL found, connecting to PostgreSQL...');
+  try {
+    db = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      connectionTimeoutMillis: 10000,
+    });
+    console.log('PostgreSQL pool created.');
+  } catch(e) {
+    console.error('Failed to create PostgreSQL pool:', e.message);
+    db = null;
+  }
+} else {
+  console.warn('DATABASE_URL not set — history endpoints will be unavailable');
+}
 
 // ── CORS
 const ALLOWED_ORIGINS = [
@@ -80,8 +97,11 @@ app.use(express.json({ limit: '2mb' }));
 
 // ── Auto-create scans table on startup
 async function initDB() {
-  if (!db) { console.warn('No DATABASE_URL — history endpoints will be unavailable'); return; }
+  if (!db) { console.warn('Skipping DB init — no pool available'); return; }
   try {
+    // Test the connection first
+    await db.query('SELECT 1');
+    console.log('PostgreSQL connection test passed.');
     await db.query(`
       CREATE TABLE IF NOT EXISTS scans (
         id TEXT PRIMARY KEY,
@@ -99,9 +119,10 @@ async function initDB() {
         full_result JSONB
       );
     `);
-    console.log('Database ready.');
+    console.log('Database ready. Table scans exists or was created.');
   } catch (err) {
     console.error('DB init error:', err.message);
+    db = null; // disable DB if it fails
   }
 }
 
