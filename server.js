@@ -1,10 +1,16 @@
 // Who's Behind That? — Proxy Server
-// Handles: post text fetching + Claude AI scoring
+// Handles: post text fetching, Claude AI scoring, shared history (PostgreSQL)
 // Deploy to Render.com (free tier)
 //
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.5.0 — Shared history via PostgreSQL. New endpoints: /history/save,
+//           /history/list, /history/comment. Scan IDs in format
+//           WBT-{date}-{appVer}-{srvVer}-{random}. App + server version
+//           logged per scan. Comments field per scan, server-synced.
+//           Auto-creates scans table on first run.
+//
 // v1.4.1 — Fixed two scoring bugs: (1) "alignment" field now mandatory in
 //           prompt — Claude was omitting it causing all matches to show as
 //           primary. (2) Added explicit "criticism ≠ alignment" rule — a post
@@ -36,59 +42,89 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.4.1';
+const SERVER_VERSION = '1.5.0';
 
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
+import pg from 'pg';
 
+const { Pool } = pg;
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Your Anthropic API key — set this in Render's environment variables
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 
-// ── CORS: allow your GitHub Pages domain + localhost for dev
+// ── PostgreSQL connection pool
+// DATABASE_URL is set automatically by Render when you attach a PostgreSQL instance
+const db = process.env.DATABASE_URL ? new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+}) : null;
+
+// ── CORS
 const ALLOWED_ORIGINS = [
   /^https:\/\/.*\.github\.io$/,
   /^http:\/\/localhost(:\d+)?$/,
   /^http:\/\/127\.0\.0\.1(:\d+)?$/,
 ];
-
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin) return callback(null, true); // allow non-browser requests
+    if (!origin) return callback(null, true);
     if (ALLOWED_ORIGINS.some(r => r.test(origin))) return callback(null, true);
     callback(new Error('Not allowed by CORS'));
   }
 }));
+app.use(express.json({ limit: '2mb' }));
 
-app.use(express.json({ limit: '1mb' }));
+// ── Auto-create scans table on startup
+async function initDB() {
+  if (!db) { console.warn('No DATABASE_URL — history endpoints will be unavailable'); return; }
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS scans (
+        id TEXT PRIMARY KEY,
+        ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        url TEXT NOT NULL,
+        post_text TEXT,
+        overall_score INTEGER,
+        overall_label TEXT,
+        top_matches TEXT[],
+        text_ai INTEGER,
+        has_image BOOLEAN DEFAULT FALSE,
+        app_version TEXT,
+        server_version TEXT,
+        comment TEXT DEFAULT '',
+        full_result JSONB
+      );
+    `);
+    console.log('Database ready.');
+  } catch (err) {
+    console.error('DB init error:', err.message);
+  }
+}
 
-// ── Health check
+// ─────────────────────────────────────────────
+// HEALTH CHECK
+// ─────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: "Who's Behind That? API", version: SERVER_VERSION });
+  res.json({ status: 'ok', service: "Who's Behind That? API", version: SERVER_VERSION, db: !!db });
 });
 
 // ─────────────────────────────────────────────
 // POST /fetch-post
-// Body: { url: "https://x.com/..." }
-// Returns: { text, platform, author, timestamp }
 // ─────────────────────────────────────────────
 app.post('/fetch-post', async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
-
   try {
     const platform = detectPlatform(url);
     if (!platform) return res.status(400).json({ error: 'Unsupported platform. Use X, Facebook, or Instagram URLs.' });
-
     let result;
     if (platform === 'x') result = await fetchFromX(url);
     else if (platform === 'facebook') result = await fetchFromFacebook(url);
     else if (platform === 'instagram') result = await fetchFromInstagram(url);
-
     res.json({ success: true, platform, ...result });
   } catch (err) {
     console.error('fetch-post error:', err.message);
@@ -98,15 +134,12 @@ app.post('/fetch-post', async (req, res) => {
 
 // ─────────────────────────────────────────────
 // POST /analyze
-// Body: { url, postText, entities }
-// Returns: full Claude analysis result
 // ─────────────────────────────────────────────
 app.post('/analyze', async (req, res) => {
   const { url, postText, entities } = req.body;
   if (!postText) return res.status(400).json({ error: 'postText is required' });
   if (!entities || !entities.length) return res.status(400).json({ error: 'entities array is required' });
   if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
-
   try {
     const result = await scoreWithClaude(postText, entities);
     res.json({ success: true, ...result });
@@ -118,38 +151,114 @@ app.post('/analyze', async (req, res) => {
 
 // ─────────────────────────────────────────────
 // POST /fetch-and-analyze
-// Body: { url, entities }
-// One-shot: fetches post text then scores it
 // ─────────────────────────────────────────────
 app.post('/fetch-and-analyze', async (req, res) => {
   const { url, entities } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
   if (!entities || !entities.length) return res.status(400).json({ error: 'entities array is required' });
   if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
-
   try {
     const platform = detectPlatform(url);
     if (!platform) return res.status(400).json({ error: 'Unsupported platform. Use X, Facebook, or Instagram URLs.' });
-
-    // Step 1: fetch post
     let postData;
     if (platform === 'x') postData = await fetchFromX(url);
     else if (platform === 'facebook') postData = await fetchFromFacebook(url);
     else if (platform === 'instagram') postData = await fetchFromInstagram(url);
-
     if (!postData.text) return res.status(422).json({ error: 'Could not extract post text. The post may be private or the platform may be blocking access.' });
-
-    // Step 2: score with Claude
     const analysis = await scoreWithClaude(postData.text, entities);
-
-    res.json({
-      success: true,
-      platform,
-      post: postData,
-      analysis
-    });
+    res.json({ success: true, platform, post: postData, analysis });
   } catch (err) {
     console.error('fetch-and-analyze error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /research-actor
+// ─────────────────────────────────────────────
+app.post('/research-actor', async (req, res) => {
+  const { handle, url } = req.body;
+  if (!handle) return res.status(400).json({ error: 'handle is required' });
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
+  try {
+    const actor = await researchActorWithClaude(handle, url);
+    res.json({ success: true, actor });
+  } catch (err) {
+    console.error('research-actor error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /history/save
+// Saves a completed scan to the shared database
+// Body: full scan entry object from frontend
+// ─────────────────────────────────────────────
+app.post('/history/save', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const { id, ts, url, postText, overallScore, overallLabel, topMatches, textAI, hasImage, appVersion, serverVersion, fullResult } = req.body;
+  if (!id || !url) return res.status(400).json({ error: 'id and url are required' });
+  try {
+    await db.query(
+      `INSERT INTO scans (id, ts, url, post_text, overall_score, overall_label, top_matches, text_ai, has_image, app_version, server_version, comment, full_result)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, '', $12)
+       ON CONFLICT (id) DO NOTHING`,
+      [id, ts || new Date().toISOString(), url, postText || '', overallScore || 0, overallLabel || '', topMatches || [], textAI || 5, hasImage || false, appVersion || '', serverVersion || '', fullResult ? JSON.stringify(fullResult) : null]
+    );
+    res.json({ success: true, id });
+  } catch (err) {
+    console.error('history/save error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /history/list
+// Returns all scans, newest first
+// ─────────────────────────────────────────────
+app.get('/history/list', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  try {
+    const result = await db.query(
+      `SELECT id, ts, url, post_text, overall_score, overall_label, top_matches, text_ai, has_image, app_version, server_version, comment, full_result
+       FROM scans ORDER BY ts DESC LIMIT 500`
+    );
+    const rows = result.rows.map(r => ({
+      id: r.id,
+      ts: r.ts,
+      url: r.url,
+      postText: r.post_text,
+      overallScore: r.overall_score,
+      overallLabel: r.overall_label,
+      topMatches: r.top_matches,
+      textAI: r.text_ai,
+      hasImage: r.has_image,
+      appVersion: r.app_version,
+      serverVersion: r.server_version,
+      comment: r.comment || '',
+      fullResult: r.full_result
+    }));
+    res.json({ success: true, scans: rows });
+  } catch (err) {
+    console.error('history/list error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// PATCH /history/comment
+// Updates the comment on a scan
+// Body: { id, comment }
+// ─────────────────────────────────────────────
+app.patch('/history/comment', async (req, res) => {
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const { id, comment } = req.body;
+  if (!id) return res.status(400).json({ error: 'id is required' });
+  try {
+    await db.query('UPDATE scans SET comment = $1 WHERE id = $2', [comment || '', id]);
+    res.json({ success: true, id });
+  } catch (err) {
+    console.error('history/comment error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -165,28 +274,16 @@ function detectPlatform(url) {
 }
 
 // ─────────────────────────────────────────────
-// X / TWITTER FETCHER
-// Uses oEmbed API (free, no auth needed for public tweets)
+// X FETCHER (oEmbed)
 // ─────────────────────────────────────────────
 async function fetchFromX(url) {
-  // Try oEmbed first — works for public posts, no API key needed
   const oembedUrl = `https://publish.twitter.com/oembed?url=${encodeURIComponent(url)}&omit_script=true`;
-
-  const response = await fetch(oembedUrl, {
-    headers: { 'User-Agent': 'WhoBehindThat/1.3' },
-    timeout: 10000
-  });
-
+  const response = await fetch(oembedUrl, { headers: { 'User-Agent': 'WhoBehindThat/1.5' }, timeout: 10000 });
   if (!response.ok) throw new Error(`X oEmbed API returned ${response.status}. The post may be private, deleted, or from a protected account.`);
-
   const data = await response.json();
-
-  // oEmbed returns HTML — extract plain text from it
   const $ = cheerio.load(data.html || '');
-  // Remove the trailing "— Author (@handle) Date" line
   $('a').last().remove();
   const rawText = $('p').first().text().trim();
-
   return {
     text: rawText,
     author: data.author_name || null,
@@ -198,126 +295,63 @@ async function fetchFromX(url) {
 
 // ─────────────────────────────────────────────
 // FACEBOOK FETCHER
-// Uses oEmbed (works for public posts)
 // ─────────────────────────────────────────────
 async function fetchFromFacebook(url) {
   const oembedUrl = `https://www.facebook.com/plugins/post/oembed.json/?url=${encodeURIComponent(url)}`;
-
-  const response = await fetch(oembedUrl, {
-    headers: { 'User-Agent': 'WhoBehindThat/1.3' },
-    timeout: 10000
-  });
-
-  if (!response.ok) {
-    // Facebook oEmbed is less reliable — fall back to meta scrape
-    return await scrapeOpenGraph(url, 'facebook');
-  }
-
+  const response = await fetch(oembedUrl, { headers: { 'User-Agent': 'WhoBehindThat/1.5' }, timeout: 10000 });
+  if (!response.ok) return await scrapeOpenGraph(url, 'facebook');
   const data = await response.json();
-  return {
-    text: data.body_text || stripHtml(data.html || ''),
-    author: data.author_name || null,
-    html: data.html,
-    source: 'oembed'
-  };
+  return { text: data.body_text || stripHtml(data.html || ''), author: data.author_name || null, html: data.html, source: 'oembed' };
 }
 
 // ─────────────────────────────────────────────
 // INSTAGRAM FETCHER
-// Uses oEmbed (works for public posts)
 // ─────────────────────────────────────────────
 async function fetchFromInstagram(url) {
   const oembedUrl = `https://graph.facebook.com/v18.0/instagram_oembed?url=${encodeURIComponent(url)}&omitscript=true`;
-
-  const response = await fetch(oembedUrl, {
-    headers: { 'User-Agent': 'WhoBehindThat/1.3' },
-    timeout: 10000
-  });
-
-  if (!response.ok) {
-    return await scrapeOpenGraph(url, 'instagram');
-  }
-
+  const response = await fetch(oembedUrl, { headers: { 'User-Agent': 'WhoBehindThat/1.5' }, timeout: 10000 });
+  if (!response.ok) return await scrapeOpenGraph(url, 'instagram');
   const data = await response.json();
-  // Extract handle from author_url e.g. https://www.instagram.com/username/
   const handleMatch = (data.author_url || '').match(/instagram\.com\/([^\/\?]+)/i);
   const authorHandle = handleMatch ? handleMatch[1] : (data.author_name || null);
-  return {
-    text: stripHtml(data.html || ''),
-    author: data.author_name || null,
-    authorHandle: authorHandle,
-    html: data.html,
-    source: 'oembed'
-  };
+  return { text: stripHtml(data.html || ''), author: data.author_name || null, authorHandle, html: data.html, source: 'oembed' };
 }
 
 // ─────────────────────────────────────────────
-// OPEN GRAPH FALLBACK SCRAPER
-// Grabs og:description / og:title from page meta
-// Less detailed but works when oEmbed fails
+// OPEN GRAPH FALLBACK
 // ─────────────────────────────────────────────
 async function scrapeOpenGraph(url, platform) {
   const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-      'Accept': 'text/html',
-      'Accept-Language': 'en-US,en;q=0.9'
-    },
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)', 'Accept': 'text/html', 'Accept-Language': 'en-US,en;q=0.9' },
     timeout: 12000
   });
-
   if (!response.ok) throw new Error(`Could not access ${platform} post (HTTP ${response.status}). The post may be private or deleted.`);
-
   const html = await response.text();
   const $ = cheerio.load(html);
-
-  const ogDescription = $('meta[property="og:description"]').attr('content') || '';
-  const ogTitle = $('meta[property="og:title"]').attr('content') || '';
-  const twitterDesc = $('meta[name="twitter:description"]').attr('content') || '';
-
-  const text = ogDescription || twitterDesc || ogTitle;
+  const text = $('meta[property="og:description"]').attr('content') || $('meta[name="twitter:description"]').attr('content') || $('meta[property="og:title"]').attr('content') || '';
   if (!text) throw new Error(`Could not extract text from ${platform} post. It may require login to view.`);
-
   return { text, author: null, source: 'opengraph' };
 }
 
 // ─────────────────────────────────────────────
 // CLAUDE SCORING ENGINE
-// Scores entities in batches of 10 for consistency.
-// temperature: 0 for deterministic output.
-// Returns all entities >= 60% so frontend can show
-// reasoning even for moderate matches.
 // ─────────────────────────────────────────────
 const BATCH_SIZE = 10;
 
 async function scoreWithClaude(postText, entities) {
-  // Split entities into batches of BATCH_SIZE
   const batches = [];
-  for (let i = 0; i < entities.length; i += BATCH_SIZE) {
-    batches.push(entities.slice(i, i + BATCH_SIZE));
-  }
-
-  // Score each batch in parallel
+  for (let i = 0; i < entities.length; i += BATCH_SIZE) batches.push(entities.slice(i, i + BATCH_SIZE));
   const batchResults = await Promise.all(batches.map(batch => scoreBatch(postText, batch)));
-
-  // Flatten and merge all matches, deduplicate by id
   const allMatches = [];
-  let text_ai_score = 5;
-  let text_ai_reason = '';
-
+  let text_ai_score = 5, text_ai_reason = '';
   for (const result of batchResults) {
     if (result.text_ai_score) text_ai_score = result.text_ai_score;
     if (result.text_ai_reason) text_ai_reason = result.text_ai_reason;
     for (const match of (result.matches || [])) {
-      if (!allMatches.find(m => m.id === match.id)) {
-        allMatches.push(match);
-      }
+      if (!allMatches.find(m => m.id === match.id)) allMatches.push(match);
     }
   }
-
-  // Sort by combined score descending
   allMatches.sort((a, b) => b.pct - a.pct);
-
   return { text_ai_score, text_ai_reason, matches: allMatches };
 }
 
@@ -358,8 +392,8 @@ The frontend will apply the 85% threshold for display.
 
 PRIMARY vs SECONDARY ALIGNMENT:
 After scoring, classify each match (combined_score >= 60) as either:
-- "primary": This entity is a DIRECT beneficiary — the post appears to have been written with this entity's agenda in mind, consciously or not. The post's framing, vocabulary, and emphasis serve this entity's interest in a direct, intentional-looking way.
-- "secondary": This entity is an INDIRECT or COLLATERAL beneficiary — the post was not necessarily written for them, but its spread still serves their interests as a side effect. Example: a post attacking Netanyahu's coalition serves Israeli opposition directly (primary), but also benefits Qatar by portraying Israel's government as unstable (secondary).
+- "primary": This entity is a DIRECT beneficiary — the post appears to have been written with this entity's agenda in mind, consciously or not.
+- "secondary": This entity is an INDIRECT or COLLATERAL beneficiary — the post was not necessarily written for them, but its spread still serves their interests as a side effect.
 
 CRITICAL RULE — CRITICISM IS NOT ALIGNMENT:
 If a post ATTACKS, CRITICIZES, or DELEGITIMIZES an entity, that entity scores LOW on primary alignment — being criticized does not serve your interest. A post mocking Netanyahu does NOT align with Netanyahu. A post exposing Hamas atrocities does NOT align with Hamas. Only score an entity high if spreading the post HELPS them.
@@ -399,24 +433,10 @@ Respond ONLY with valid JSON, no preamble, no markdown:
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_KEY,
-      'anthropic-version': '2023-06-01'
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-5',
-      max_tokens: 2000,
-      temperature: 0,
-      messages: [{ role: 'user', content: prompt }]
-    })
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 2000, temperature: 0, messages: [{ role: 'user', content: prompt }] })
   });
-
-  if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error('Claude API error: ' + (err.error?.message || response.status));
-  }
-
+  if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error('Claude API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
   const raw = data.content.map(c => c.text || '').join('').trim();
   const clean = raw.replace(/```json|```/g, '').trim();
@@ -424,31 +444,8 @@ Respond ONLY with valid JSON, no preamble, no markdown:
 }
 
 // ─────────────────────────────────────────────
-// HELPERS
+// ACTOR RESEARCH
 // ─────────────────────────────────────────────
-function stripHtml(html) {
-  return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
-// ─────────────────────────────────────────────
-// POST /research-actor
-// Body: { handle, url }
-// Returns: { actor: { name, bio, location, handles } }
-// ─────────────────────────────────────────────
-app.post('/research-actor', async (req, res) => {
-  const { handle, url } = req.body;
-  if (!handle) return res.status(400).json({ error: 'handle is required' });
-  if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
-
-  try {
-    const actor = await researchActorWithClaude(handle, url);
-    res.json({ success: true, actor });
-  } catch (err) {
-    console.error('research-actor error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 async function researchActorWithClaude(handle, url) {
   const prompt = `You are an open-source intelligence (OSINT) researcher. Research the following social media account and provide a factual profile based on publicly available information.
 
@@ -473,31 +470,28 @@ Respond ONLY with valid JSON, no preamble, no markdown:
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_KEY,
-      'anthropic-version': '2023-06-01'
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-5',
-      max_tokens: 800,
-      messages: [{ role: 'user', content: prompt }]
-    })
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 800, temperature: 0, messages: [{ role: 'user', content: prompt }] })
   });
-
-  if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error('Claude API error: ' + (err.error?.message || response.status));
-  }
-
+  if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error('Claude API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
   const raw = data.content.map(c => c.text || '').join('').trim();
   const clean = raw.replace(/```json|```/g, '').trim();
   return JSON.parse(clean);
 }
 
+// ─────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────
+function stripHtml(html) { return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); }
 
-app.listen(PORT, () => {
-  console.log(`Who's Behind That? server running on port ${PORT}`);
-  if (!ANTHROPIC_KEY) console.warn('WARNING: ANTHROPIC_API_KEY not set — /analyze endpoints will fail');
+// ─────────────────────────────────────────────
+// START
+// ─────────────────────────────────────────────
+initDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Who's Behind That? server v${SERVER_VERSION} running on port ${PORT}`);
+    if (!ANTHROPIC_KEY) console.warn('WARNING: ANTHROPIC_API_KEY not set — scoring endpoints will fail');
+    if (!db) console.warn('WARNING: DATABASE_URL not set — history endpoints will be unavailable');
+  });
 });
