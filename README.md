@@ -1,5 +1,11 @@
 # Who's Behind That? — Server Changelog
 
+### v1.5.0 (server) | Main file: v1.9.0
+- PostgreSQL integration: /history/save, /history/list, /history/comment endpoints
+- Auto-creates scans table on first run
+- DATABASE_URL environment variable support
+- New dependency: pg (PostgreSQL Node.js client)
+
 ### v1.4.1 — bug fix (server) | Main file: v1.8.1
 - alignment field now mandatory on every match — was being omitted causing all to show as primary
 - Added "criticism ≠ alignment" rule to prompt — post attacking Netanyahu no longer scores as Netanyahu-aligned
