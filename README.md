@@ -1,5 +1,20 @@
 # Who's Behind That? — Server Changelog
 
+### v1.5.1 — bug fix (server) | Main file: v1.9.0
+- Fixed silent PostgreSQL failure: connection errors now logged explicitly to Render logs
+- Added SELECT 1 connection test on startup to verify database is reachable
+- Graceful fallback: if connection fails, server sets db=null and continues serving all other endpoints
+- Accurate health check: "db": true/false now correctly reflects whether connection succeeded
+
+### v1.5.0 (server) | Main file: v1.9.0 - FIX WITHOUT VERSION
+- Shared history: all scans saved to PostgreSQL and visible to all users across all devices
+- Scan IDs in format WBT-{date}-{appVer}-{srvVer}-{random}
+- App and server version logged per scan for tracing issues to specific releases
+- Comments field per scan, editable inline, synced to server
+- New endpoints: POST /history/save, GET /history/list, PATCH /history/comment
+- Auto table creation: scans table created on first server start, no manual DB setup needed
+- New dependency: pg added to package.json — update both files when deploying
+
 ### v1.5.0 (server) | Main file: v1.9.0
 - PostgreSQL integration: /history/save, /history/list, /history/comment endpoints
 - Auto-creates scans table on first run
