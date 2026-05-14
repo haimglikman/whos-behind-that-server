@@ -5,6 +5,10 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.6.0 — Entity relationship modeling + coherence check. After batch
+//           scoring, a second Claude call filters out rival-bloc entities.
+//           A post serving Israeli opposition no longer flags Iran/Hamas.
+//
 // v1.5.1 — Fixed PostgreSQL connection: better error handling and logging,
 //           test query on startup, db=null if connection fails so server
 //           still starts. Helps diagnose DATABASE_URL issues on Render.
@@ -46,7 +50,7 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.5.1';
+const SERVER_VERSION = '1.6.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -373,7 +377,91 @@ async function scoreWithClaude(postText, entities) {
     }
   }
   allMatches.sort((a, b) => b.pct - a.pct);
-  return { text_ai_score, text_ai_reason, matches: allMatches };
+
+  // Run coherence check on matches above 60%
+  const candidates = allMatches.filter(m => m.pct >= 60);
+  let finalMatches = allMatches;
+  if (candidates.length > 1) {
+    try {
+      const coherent = await coherenceCheck(postText, candidates, entities);
+      // Replace candidate matches with coherence-filtered versions
+      const coherentIds = new Set(coherent.map(m => m.id));
+      finalMatches = allMatches.map(m => {
+        if (!coherentIds.has(m.id) && m.pct >= 60) {
+          // Demoted by coherence check — zero out pct so it falls below threshold
+          return Object.assign({}, m, { pct: Math.min(m.pct, 50), why: '', missing: '', alignment: '' });
+        }
+        // Update with coherence-refined alignment/why/missing
+        const refined = coherent.find(c => c.id === m.id);
+        return refined ? Object.assign({}, m, refined) : m;
+      });
+    } catch(e) {
+      console.warn('Coherence check failed, using raw scores:', e.message);
+    }
+  }
+
+  return { text_ai_score, text_ai_reason, matches: finalMatches };
+}
+
+async function coherenceCheck(postText, candidates, allEntities) {
+  const candidateSummary = candidates.map(m => {
+    const e = allEntities.find(x => x.id === m.id);
+    return `ID:${m.id} NAME:${m.name} SCORE:${m.pct}% ALIGNMENT:${m.alignment||'?'}`;
+  }).join('\n');
+
+  const prompt = `You are a senior geopolitical analyst. A scoring engine has identified the following entities as potentially aligned with a social media post. Your job is to apply a coherence filter — a single post can only realistically serve one coherent political direction at a time.
+
+SOCIAL MEDIA POST TEXT:
+"${postText}"
+
+CANDIDATE MATCHES (already scored):
+${candidateSummary}
+
+ENTITY RELATIONSHIPS TO CONSIDER:
+- Iran, Hamas, Hezbollah, PIJ, Houthis, Muslim Brotherhood form the "Axis of Resistance" — they share interests
+- Israeli Opposition, Protest Movement, Hostage Families, Lieberman, Israeli Left are anti-Netanyahu Israeli domestic voices — they share interests
+- Netanyahu government, Ben Gvir/Smotrich, AIPAC, Evangelical Zionists, US pro-Israel bloc share interests
+- Palestinian Authority / Fatah and Hamas are RIVALS
+- Israel and Iran are RIVALS
+- US pro-Israel bloc (Trump, Rubio, Vance, AIPAC) and US Progressive Caucus (AOC) are RIVALS on this issue
+- Russia and China benefit opportunistically but are not part of any primary bloc
+- Human rights orgs (Amnesty, HRW, B'Tselem, ICC/ICJ) operate independently but often align with criticism of Israeli military conduct
+- AOC/Progressive Caucus may align with human rights orgs and Israeli left — but NOT with Iran or Hamas
+
+TASK:
+1. Identify the single most coherent political direction this post serves
+2. Keep entities that genuinely fit that direction (including legitimate secondary/collateral beneficiaries)
+3. REMOVE entities that belong to rival blocs — if the post serves the Israeli opposition, remove Iran and Hamas
+4. You may adjust the "alignment" field (primary/secondary) based on your coherence assessment
+5. Maximum 3 primary, 2 secondary in your final output
+
+CRITICAL: A post criticizing Netanyahu may align with Israeli opposition AND with human rights orgs AND with AOC — that is coherent. But it should NOT align with Iran or Hamas just because they also oppose Netanyahu. Different reasons, different agendas, incompatible framing.
+
+Respond ONLY with valid JSON — the filtered list of matches to KEEP:
+{
+  "matches": [
+    {
+      "id": 51,
+      "name": "Israeli Opposition Bloc",
+      "pct": 91,
+      "alignment": "primary",
+      "why": "...",
+      "missing": "..."
+    }
+  ]
+}`;
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 1500, temperature: 0, messages: [{ role: 'user', content: prompt }] })
+  });
+  if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error('Coherence check API error: ' + (err.error?.message || response.status)); }
+  const data = await response.json();
+  const raw = data.content.map(c => c.text || '').join('').trim();
+  const clean = raw.replace(/```json|```/g, '').trim();
+  const result = JSON.parse(clean);
+  return result.matches || [];
 }
 
 async function scoreBatch(postText, entities) {
