@@ -1,5 +1,11 @@
 # Who's Behind That? — Server Changelog
 
+### v1.6.0 (server) | Main file: v1.10.0
+- Coherence check: second Claude call after batch scoring filters rival-bloc entities
+- Post serving Israeli opposition no longer flags Iran/Hamas as co-alignments
+- Relationship context (Axis of Resistance, Israeli opposition coalition, US pro-Israel bloc etc.) passed to coherence prompt
+- Graceful fallback to raw scores if coherence check fails
+
 ### v1.5.1 — bug fix (server) | Main file: v1.9.0
 - Fixed silent PostgreSQL failure: connection errors now logged explicitly to Render logs
 - Added SELECT 1 connection test on startup to verify database is reachable
