@@ -12,7 +12,7 @@
 - Graceful fallback: if connection fails, server sets db=null and continues serving all other endpoints
 - Accurate health check: "db": true/false now correctly reflects whether connection succeeded
 
-### v1.5.0 (server) | Main file: v1.9.0 - FIX WITHOUT VERSION
+### v1.5.0 (server) | Main file: v1.9.0 - FIX WITHOUT VERSION UPDATE
 - Shared history: all scans saved to PostgreSQL and visible to all users across all devices
 - Scan IDs in format WBT-{date}-{appVer}-{srvVer}-{random}
 - App and server version logged per scan for tracing issues to specific releases
