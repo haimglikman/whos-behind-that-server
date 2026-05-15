@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v1.8.0 (server) | Main file: v1.12.0
+- Instagram and Facebook fetching replaced with Claude web_search tool
+- Removes dependency on broken oEmbed and OpenGraph scraping
+- Falls back to manual text if post is private or requires login
+
 ### v1.7.1 — bug fix (server) | Main file: v1.11.0
 - Added pre-translation step: Hebrew/Arabic posts translated + summarized with political context before scoring
 - Fixes zero alignment on Hebrew settler/opposition posts that correctly identified entities in the vocabulary but failed to match
