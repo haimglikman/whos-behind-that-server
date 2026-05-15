@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v1.8.2 — bug fix (server) | Main file: v1.12.0
+- Fixed Claude web search not actually calling the tool (was responding from memory)
+- Added tool_choice: any to force tool use before responding
+- Added proper multi-turn handling: tool_use → tool_result → final answer
+
 ### v1.8.1 — bug fix (server) | Main file: v1.12.0
 - Fixed Instagram/Facebook response parsing: three-tier extraction (clean parse → regex → raw text fallback)
 - Added debug logging so Render logs show exactly what Claude returns
