@@ -5,12 +5,11 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.8.4 — Restored Instagram oEmbed + OpenGraph scraping (was working
-//           before v1.8.0 replaced it with Claude web search). Restored
-//           scrapeOpenGraph function. Manual fallback still shown if fetch
-//           fails.
+// v1.8.5 — Added minimum text length check after fetch: if extracted text
+//           is under 200 chars (OpenGraph title-only), show manual fallback
+//           instead of sending incomplete text to scoring engine.
 //
-// v1.8.3 — Instagram auto-fetch removed (now restored).
+// v1.8.4 — Restored Instagram oEmbed + OpenGraph scraping.
 //           Three-tier JSON extraction: clean parse → regex extract → raw text.
 //           Added debug logging to Render logs. Increased max_tokens to 2000.
 //
@@ -74,7 +73,7 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.8.4';
+const SERVER_VERSION = '1.8.5';
 
 import express from 'express';
 import cors from 'cors';
@@ -214,6 +213,7 @@ app.post('/fetch-and-analyze', async (req, res) => {
     else if (platform === 'facebook') postData = await fetchFromFacebook(url);
     else if (platform === 'instagram') postData = await fetchFromInstagram(url);
     if (!postData.text) return res.status(422).json({ error: 'Could not extract post text. The post may be private or the platform may be blocking access.' });
+    if (postData.text.length < 200) return res.status(422).json({ error: `Fetched text is too short (${postData.text.length} chars) — OpenGraph likely returned only a title or preview. Please paste the full post text manually.` });
     const analysis = await scoreWithClaude(postData.text, entities);
     res.json({ success: true, platform, post: postData, analysis });
   } catch (err) {
