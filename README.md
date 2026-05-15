@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v1.8.5 — bug fix (server) | Main file: v1.12.3
+- Added minimum text length check: fetched text under 200 chars triggers manual fallback
+- Prevents OpenGraph title-only results from being sent to scoring engine silently
+
 ### v1.8.4 — bug fix (server) | Main file: v1.12.3
 - Restored Instagram oEmbed + OpenGraph scraping that worked before v1.8.0
 - Restored scrapeOpenGraph function that was accidentally removed
