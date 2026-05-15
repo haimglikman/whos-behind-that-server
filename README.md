@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.8.0 — bug fix update NO VERSION UPDATE
+- Fixed duplicate fetchFromFacebook declaration causing server startup failure
+
 ### v1.8.0 (server) | Main file: v1.12.0
 - Instagram and Facebook fetching replaced with Claude web_search tool
 - Removes dependency on broken oEmbed and OpenGraph scraping
