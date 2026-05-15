@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v1.8.1 — bug fix (server) | Main file: v1.12.0
+- Fixed Instagram/Facebook response parsing: three-tier extraction (clean parse → regex → raw text fallback)
+- Added debug logging so Render logs show exactly what Claude returns
+- Increased web search max_tokens from 1000 to 2000
+
 ### v1.8.0 — bug fix update NO VERSION UPDATE
 - Fixed duplicate fetchFromFacebook declaration causing server startup failure
 
