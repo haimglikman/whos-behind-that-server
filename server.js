@@ -5,6 +5,10 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.8.2 — Fixed Claude web search not actually calling the tool. Added
+//           tool_choice:any to force tool use, proper multi-turn handling
+//           for tool_use → tool_result → final answer flow.
+//
 // v1.8.1 — Fixed Instagram/Facebook Claude web search response parsing.
 //           Three-tier JSON extraction: clean parse → regex extract → raw text.
 //           Added debug logging to Render logs. Increased max_tokens to 2000.
@@ -69,7 +73,7 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.8.1';
+const SERVER_VERSION = '1.8.2';
 
 import express from 'express';
 import cors from 'cors';
@@ -362,102 +366,107 @@ async function fetchFromFacebook(url) {
 async function fetchWithClaudeWebSearch(url, platform) {
   if (!ANTHROPIC_KEY) throw new Error('ANTHROPIC_API_KEY not configured');
 
-  const prompt = `Please fetch the content of this ${platform} post and extract:
-1. The full text/caption of the post
-2. The author's name or handle if visible
-3. The author's profile URL if visible
+  const prompt = `Use your web_search tool to search for this URL and retrieve the post content: ${url}
 
-Post URL: ${url}
-
-Respond ONLY with valid JSON:
+After searching, extract the full post text and author information. Return JSON only:
 {
-  "text": "full post text here",
+  "text": "full post caption/text",
   "author": "author name or null",
-  "authorHandle": "handle without @ or null",
-  "authorUrl": "profile URL or null"
-}
-
-If you cannot access the post (private, deleted, requires login), respond with:
-{
-  "text": null,
-  "error": "reason why"
+  "authorHandle": "username without @ or null"
 }`;
 
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
+  // First call — force tool use
+  const firstResponse = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_KEY,
-      'anthropic-version': '2023-06-01'
-    },
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
     body: JSON.stringify({
       model: 'claude-sonnet-4-5',
       max_tokens: 2000,
       temperature: 0,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      tool_choice: { type: 'any' },
       messages: [{ role: 'user', content: prompt }]
     })
   });
 
-  if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error('Claude web search error: ' + (err.error?.message || response.status));
+  if (!firstResponse.ok) {
+    const err = await firstResponse.json().catch(() => ({}));
+    throw new Error('Claude web search error: ' + (err.error?.message || firstResponse.status));
   }
 
-  const data = await response.json();
+  const firstData = await firstResponse.json();
+  console.log(`${platform} fetch — stop_reason: ${firstData.stop_reason}, blocks: ${firstData.content.length}`);
 
-  // Log raw response for debugging
-  console.log(`${platform} fetch — stop_reason: ${data.stop_reason}, content blocks: ${data.content.length}`);
+  // If Claude returned text directly (tool_choice:any but still returned text), extract it
+  if (firstData.stop_reason === 'end_turn') {
+    const textContent = firstData.content.filter(c => c.type === 'text').map(c => c.text).join('');
+    return extractPostFromText(textContent, platform);
+  }
 
-  // Extract all text blocks (response may include tool_use and tool_result blocks)
-  const textContent = data.content
-    .filter(c => c.type === 'text')
-    .map(c => c.text || '')
-    .join('');
+  // Claude used the tool — send back tool results and get final answer
+  const toolUseBlocks = firstData.content.filter(c => c.type === 'tool_use');
+  const toolResults = firstData.content
+    .filter(c => c.type === 'tool_result' || c.type === 'web_search_tool_result')
+    .map(c => c);
 
-  console.log(`${platform} text content (first 300):`, textContent.slice(0, 300));
+  // Build messages with assistant response and tool results
+  const messages = [
+    { role: 'user', content: prompt },
+    { role: 'assistant', content: firstData.content },
+    {
+      role: 'user',
+      content: toolUseBlocks.map(block => ({
+        type: 'tool_result',
+        tool_use_id: block.id,
+        content: 'Search completed. Extract the post text and author from the search results above and return JSON.'
+      }))
+    }
+  ];
 
-  // Try to extract JSON from the response — handle markdown fences and surrounding text
-  let result;
+  const secondResponse = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 1000,
+      temperature: 0,
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      messages
+    })
+  });
+
+  if (!secondResponse.ok) {
+    const err = await secondResponse.json().catch(() => ({}));
+    throw new Error('Claude web search (turn 2) error: ' + (err.error?.message || secondResponse.status));
+  }
+
+  const secondData = await secondResponse.json();
+  const textContent = secondData.content.filter(c => c.type === 'text').map(c => c.text).join('');
+  console.log(`${platform} second turn content (first 300):`, textContent.slice(0, 300));
+  return extractPostFromText(textContent, platform);
+}
+
+function extractPostFromText(textContent, platform) {
+  // Try JSON extraction
   try {
-    // First try: clean and parse directly
     const clean = textContent.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
-    result = JSON.parse(clean);
+    const result = JSON.parse(clean);
+    if (result.text) return { text: result.text, author: result.author || null, authorHandle: result.authorHandle || null, html: null, source: 'claude_web_search' };
+    throw new Error(result.error || `Could not extract ${platform} post text`);
   } catch(e1) {
     try {
-      // Second try: find JSON object within the text using regex
-      const jsonMatch = textContent.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) throw new Error('No JSON found in response');
-      result = JSON.parse(jsonMatch[0]);
-    } catch(e2) {
-      // Third try: Claude may have just returned the text directly without JSON
-      // Extract it heuristically if it looks like post content
-      console.warn(`${platform} JSON parse failed, attempting text extraction. Error:`, e2.message);
-      // If the text content is long enough to be post text, use it directly
-      if (textContent.length > 50 && !textContent.includes('"text"')) {
-        return {
-          text: textContent.slice(0, 2000),
-          author: null,
-          authorHandle: null,
-          html: null,
-          source: 'claude_web_search'
-        };
+      const jsonMatch = textContent.match(/\{[\s\S]*?\}/);
+      if (jsonMatch) {
+        const result = JSON.parse(jsonMatch[0]);
+        if (result.text) return { text: result.text, author: result.author || null, authorHandle: result.authorHandle || null, html: null, source: 'claude_web_search' };
       }
-      throw new Error(`Could not parse ${platform} response: ${e2.message}`);
-    }
+    } catch(e2) {}
   }
-
-  if (!result.text) {
-    throw new Error(result.error || `Could not extract text from ${platform} post. It may be private or require login.`);
+  // Last resort: use raw text if it looks like post content
+  if (textContent.length > 80 && !textContent.toLowerCase().includes('cannot access') && !textContent.toLowerCase().includes('unable to')) {
+    return { text: textContent.slice(0, 2000), author: null, authorHandle: null, html: null, source: 'claude_web_search' };
   }
-
-  return {
-    text: result.text,
-    author: result.author || null,
-    authorHandle: result.authorHandle || null,
-    html: null,
-    source: 'claude_web_search'
-  };
+  throw new Error(`Could not extract text from ${platform} post. It may be private or require login.`);
 }
 
 // ─────────────────────────────────────────────
