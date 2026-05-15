@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v1.7.0 (server) | Main file: v1.11.0
+- Language-aware scoring: prompt now handles English, Hebrew, and Arabic with vocabulary glossary
+- Intra-coalition criticism rule: settler/Ben Gvir posts criticizing Netanyahu no longer flag Netanyahu as aligned
+- Coherence check updated with finer coalition distinction logic
+
 ### v1.6.0 (server) | Main file: v1.10.0
 - Coherence check: second Claude call after batch scoring filters rival-bloc entities
 - Post serving Israeli opposition no longer flags Iran/Hamas as co-alignments
