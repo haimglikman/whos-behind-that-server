@@ -5,11 +5,11 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.8.5 — Added minimum text length check after fetch: if extracted text
-//           is under 200 chars (OpenGraph title-only), show manual fallback
-//           instead of sending incomplete text to scoring engine.
+// v1.9.0 — Instagram fetching now uses Puppeteer headless browser to
+//           execute JavaScript and extract full post text. Falls back to
+//           OpenGraph scraping if Puppeteer fails. New dependency: puppeteer.
 //
-// v1.8.4 — Restored Instagram oEmbed + OpenGraph scraping.
+// v1.8.5 — Added minimum text length check after fetch.
 //           Three-tier JSON extraction: clean parse → regex extract → raw text.
 //           Added debug logging to Render logs. Increased max_tokens to 2000.
 //
@@ -73,13 +73,14 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.8.5';
+const SERVER_VERSION = '1.9.0';
 
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
 import pg from 'pg';
+import puppeteer from 'puppeteer';
 
 const { Pool } = pg;
 const app = express();
@@ -345,27 +346,92 @@ async function fetchFromX(url) {
 // ─────────────────────────────────────────────
 // FACEBOOK FETCHER
 // ─────────────────────────────────────────────
-// ─────────────────────────────────────────────
-// INSTAGRAM FETCHER — oEmbed + OpenGraph scraping
-// Works for public posts via meta tags
+// INSTAGRAM FETCHER — Puppeteer headless browser
+// Uses real browser to execute JS and get full text
+// Falls back to OpenGraph if Puppeteer fails
 // ─────────────────────────────────────────────
 async function fetchFromInstagram(url) {
-  // Try oEmbed first
   try {
-    const oembedUrl = `https://graph.facebook.com/v18.0/instagram_oembed?url=${encodeURIComponent(url)}&omitscript=true`;
-    const response = await fetch(oembedUrl, { headers: { 'User-Agent': 'WhoBehindThat/1.8' } });
-    if (response.ok) {
-      const data = await response.json();
-      if (data.html || data.title) {
-        const handleMatch = (data.author_url || '').match(/instagram\.com\/([^\/\?]+)/i);
-        const authorHandle = handleMatch ? handleMatch[1] : (data.author_name || null);
-        return { text: stripHtml(data.html || '') || data.title, author: data.author_name || null, authorHandle, html: data.html, source: 'oembed' };
-      }
-    }
-  } catch(e) { console.log('Instagram oEmbed failed, trying OpenGraph:', e.message); }
-
-  // Fall back to OpenGraph scraping
+    return await fetchInstagramWithPuppeteer(url);
+  } catch(e) {
+    console.log('Puppeteer failed, trying OpenGraph:', e.message);
+  }
   return await scrapeOpenGraph(url, 'instagram');
+}
+
+async function fetchInstagramWithPuppeteer(url) {
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu',
+        '--disable-blink-features=AutomationControlled'
+      ]
+    });
+
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1');
+    await page.setViewport({ width: 390, height: 844, isMobile: true });
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'en-US,en;q=0.9,he;q=0.8,ar;q=0.7',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+    });
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
+    console.log('Puppeteer navigating to:', url);
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 25000 });
+    await page.waitForSelector('article, [role="presentation"], ._aagv', { timeout: 10000 }).catch(() => {});
+
+    const postText = await page.evaluate(() => {
+      const selectors = [
+        'article h1',
+        'article span',
+        '._aagv span',
+        '._a9zs span',
+        'meta[property="og:description"]',
+        'meta[name="description"]'
+      ];
+      for (const sel of selectors) {
+        if (sel.startsWith('meta')) {
+          const el = document.querySelector(sel);
+          if (el && el.content && el.content.length > 50) return el.content;
+        } else {
+          const els = document.querySelectorAll(sel);
+          for (const el of els) {
+            const text = (el.innerText || el.textContent || '').trim();
+            if (text.length > 50) return text;
+          }
+        }
+      }
+      const og = document.querySelector('meta[property="og:description"]');
+      return og ? og.content : null;
+    });
+
+    const authorHandle = await page.evaluate(() => {
+      const canonical = document.querySelector('link[rel="canonical"]');
+      if (canonical) {
+        const m = canonical.href.match(/instagram\.com\/([^\/\?]+)\//);
+        if (m) return m[1];
+      }
+      return null;
+    });
+
+    console.log(`Puppeteer extracted ${postText ? postText.length : 0} chars`);
+    if (!postText || postText.length < 30) throw new Error('Insufficient text — Instagram may have shown login wall');
+    return { text: postText, author: null, authorHandle, html: null, source: 'puppeteer' };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
 }
 
 // ─────────────────────────────────────────────
