@@ -5,6 +5,10 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.8.1 — Fixed Instagram/Facebook Claude web search response parsing.
+//           Three-tier JSON extraction: clean parse → regex extract → raw text.
+//           Added debug logging to Render logs. Increased max_tokens to 2000.
+//
 // v1.8.0 — Instagram and Facebook now fetched via Claude web_search tool.
 //           Replaces broken oEmbed + OpenGraph scraping. Falls back to
 //           manual text if post is private or login-gated.
@@ -65,7 +69,7 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.8.0';
+const SERVER_VERSION = '1.8.1';
 
 import express from 'express';
 import cors from 'cors';
@@ -388,7 +392,7 @@ If you cannot access the post (private, deleted, requires login), respond with:
     },
     body: JSON.stringify({
       model: 'claude-sonnet-4-5',
-      max_tokens: 1000,
+      max_tokens: 2000,
       temperature: 0,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       messages: [{ role: 'user', content: prompt }]
@@ -401,18 +405,46 @@ If you cannot access the post (private, deleted, requires login), respond with:
   }
 
   const data = await response.json();
-  // Extract text blocks from response (may include tool_use blocks)
+
+  // Log raw response for debugging
+  console.log(`${platform} fetch — stop_reason: ${data.stop_reason}, content blocks: ${data.content.length}`);
+
+  // Extract all text blocks (response may include tool_use and tool_result blocks)
   const textContent = data.content
     .filter(c => c.type === 'text')
     .map(c => c.text || '')
     .join('');
 
-  const clean = textContent.replace(/```json|```/g, '').trim();
+  console.log(`${platform} text content (first 300):`, textContent.slice(0, 300));
+
+  // Try to extract JSON from the response — handle markdown fences and surrounding text
   let result;
   try {
+    // First try: clean and parse directly
+    const clean = textContent.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
     result = JSON.parse(clean);
-  } catch(e) {
-    throw new Error(`Could not parse Claude response for ${platform} post`);
+  } catch(e1) {
+    try {
+      // Second try: find JSON object within the text using regex
+      const jsonMatch = textContent.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error('No JSON found in response');
+      result = JSON.parse(jsonMatch[0]);
+    } catch(e2) {
+      // Third try: Claude may have just returned the text directly without JSON
+      // Extract it heuristically if it looks like post content
+      console.warn(`${platform} JSON parse failed, attempting text extraction. Error:`, e2.message);
+      // If the text content is long enough to be post text, use it directly
+      if (textContent.length > 50 && !textContent.includes('"text"')) {
+        return {
+          text: textContent.slice(0, 2000),
+          author: null,
+          authorHandle: null,
+          html: null,
+          source: 'claude_web_search'
+        };
+      }
+      throw new Error(`Could not parse ${platform} response: ${e2.message}`);
+    }
   }
 
   if (!result.text) {
