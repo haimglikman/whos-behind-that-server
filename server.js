@@ -336,17 +336,6 @@ async function fetchFromX(url) {
 // ─────────────────────────────────────────────
 // FACEBOOK FETCHER
 // ─────────────────────────────────────────────
-async function fetchFromFacebook(url) {
-  const oembedUrl = `https://www.facebook.com/plugins/post/oembed.json/?url=${encodeURIComponent(url)}`;
-  const response = await fetch(oembedUrl, { headers: { 'User-Agent': 'WhoBehindThat/1.5' }, timeout: 10000 });
-  if (!response.ok) return await scrapeOpenGraph(url, 'facebook');
-  const data = await response.json();
-  return { text: data.body_text || stripHtml(data.html || ''), author: data.author_name || null, html: data.html, source: 'oembed' };
-}
-
-// ─────────────────────────────────────────────
-// INSTAGRAM FETCHER
-// ─────────────────────────────────────────────
 // ─────────────────────────────────────────────
 // INSTAGRAM FETCHER — Claude web search
 // ─────────────────────────────────────────────
