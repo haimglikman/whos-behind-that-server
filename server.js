@@ -5,6 +5,13 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.7.0 — Language-aware scoring: prompt now explicitly handles English,
+//           Hebrew, and Arabic posts with key political vocabulary glossary.
+//           Intra-coalition criticism rule added to both scoring and coherence
+//           prompts: Ben Gvir/settler posts criticizing Netanyahu no longer
+//           flag Netanyahu as aligned. Coherence check updated with finer
+//           coalition distinction logic.
+//
 // v1.6.0 — Entity relationship modeling + coherence check. After batch
 //           scoring, a second Claude call filters out rival-bloc entities.
 //           A post serving Israeli opposition no longer flags Iran/Hamas.
@@ -50,7 +57,7 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.6.0';
+const SERVER_VERSION = '1.7.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -420,7 +427,7 @@ ${candidateSummary}
 ENTITY RELATIONSHIPS TO CONSIDER:
 - Iran, Hamas, Hezbollah, PIJ, Houthis, Muslim Brotherhood form the "Axis of Resistance" — they share interests
 - Israeli Opposition, Protest Movement, Hostage Families, Lieberman, Israeli Left are anti-Netanyahu Israeli domestic voices — they share interests
-- Netanyahu government, Ben Gvir/Smotrich, AIPAC, Evangelical Zionists, US pro-Israel bloc share interests
+- Netanyahu government, Ben Gvir/Smotrich, AIPAC, Evangelical Zionists, US pro-Israel bloc share interests BUT have distinct sub-interests
 - Palestinian Authority / Fatah and Hamas are RIVALS
 - Israel and Iran are RIVALS
 - US pro-Israel bloc (Trump, Rubio, Vance, AIPAC) and US Progressive Caucus (AOC) are RIVALS on this issue
@@ -428,14 +435,20 @@ ENTITY RELATIONSHIPS TO CONSIDER:
 - Human rights orgs (Amnesty, HRW, B'Tselem, ICC/ICJ) operate independently but often align with criticism of Israeli military conduct
 - AOC/Progressive Caucus may align with human rights orgs and Israeli left — but NOT with Iran or Hamas
 
+INTRA-COALITION DISTINCTION — CRITICAL:
+Entities in the same broad coalition can have conflicting sub-interests. Treat them as distinct:
+- A post criticizing Netanyahu from the RIGHT (settlers demanding harder enforcement, sovereignty language, West Bank infrastructure) aligns with Ben Gvir/Smotrich and the Settler Movement — but NOT with Netanyahu himself, who is being criticized
+- A post criticizing Netanyahu from the LEFT (hostage deal, judicial reform, democratic norms) aligns with Israeli Opposition/Protest Movement — but NOT with Iran or Hamas even if they also oppose Netanyahu
+- Ben Gvir/Smotrich and Netanyahu share a coalition but have genuine tension — settler posts that demand action Netanyahu hasn't taken align with the former, not the latter
+
 TASK:
 1. Identify the single most coherent political direction this post serves
 2. Keep entities that genuinely fit that direction (including legitimate secondary/collateral beneficiaries)
-3. REMOVE entities that belong to rival blocs — if the post serves the Israeli opposition, remove Iran and Hamas
+3. REMOVE entities that belong to rival blocs or whose specific interests don't fit this post's framing
 4. You may adjust the "alignment" field (primary/secondary) based on your coherence assessment
 5. Maximum 3 primary, 2 secondary in your final output
 
-CRITICAL: A post criticizing Netanyahu may align with Israeli opposition AND with human rights orgs AND with AOC — that is coherent. But it should NOT align with Iran or Hamas just because they also oppose Netanyahu. Different reasons, different agendas, incompatible framing.
+CRITICAL: A post criticizing Netanyahu may align with Israeli opposition AND human rights orgs AND AOC — that is coherent. But it should NOT align with Iran or Hamas. A settler enforcement post aligns with Ben Gvir/Settler Movement — but NOT with Netanyahu if he is being pressured.
 
 Respond ONLY with valid JSON — the filtered list of matches to KEEP:
 {
@@ -470,6 +483,11 @@ async function scoreBatch(postText, entities) {
   ).join('\n---\n');
 
   const prompt = `You are a senior analyst specializing in geopolitical influence operations, information warfare, and social media manipulation. Your task is to determine whose agenda a social media post serves, and what context it leaves out.
+
+LANGUAGE NOTE:
+The post may be written in English, Hebrew, or Arabic. Score based on semantic meaning and political intent regardless of the language. Do not penalize non-English posts. Key political vocabulary to recognize:
+- Hebrew: ביביזם (Bibiism/blind Netanyahu loyalty), פלישה (invasion/encroachment), ריבונות (sovereignty), יהודה ושומרון (Judea and Samaria/West Bank), אכיפה (enforcement), מאחז (outpost), עסקת חטופים (hostage deal), מחאה (protest)
+- Arabic: مقاومة (resistance), شهيد (martyr), الاحتلال (the occupation), النضال (the struggle), محور المقاومة (Axis of Resistance), التطبيع (normalization), الاستيطان (settlement)
 
 CORE PHILOSOPHY:
 The primary concern is not whether a post contains outright lies, but whether it tells only half the story to serve a specific agenda. A post can be factually accurate and still be pure propaganda if it selectively presents only the facts that serve one side. Identify: (1) whose hidden interest this post serves directly, (2) who indirectly benefits from the post being spread, and (3) what relevant context is conspicuously absent.
@@ -506,6 +524,9 @@ After scoring, classify each match (combined_score >= 60) as either:
 
 CRITICAL RULE — CRITICISM IS NOT ALIGNMENT:
 If a post ATTACKS, CRITICIZES, or DELEGITIMIZES an entity, that entity scores LOW on primary alignment — being criticized does not serve your interest. A post mocking Netanyahu does NOT align with Netanyahu. A post exposing Hamas atrocities does NOT align with Hamas. Only score an entity high if spreading the post HELPS them.
+
+CRITICAL RULE — INTRA-COALITION CRITICISM:
+Entities in the same political coalition can still have distinct and sometimes conflicting interests. A post criticizing Netanyahu from the RIGHT (e.g. settlers or Ben Gvir demanding harder enforcement) does NOT align with Netanyahu — it aligns with the settler/nationalist bloc specifically. A post criticizing Netanyahu from the LEFT aligns with the Israeli opposition, not with Iran or Hamas even if they also oppose Netanyahu. Score each entity's specific interest independently, not by coalition membership alone.
 
 Maximum 3 primary matches, maximum 2 secondary matches. If a match qualifies for both, assign it to primary only.
 The "alignment" field is MANDATORY on every match — always set it to either "primary" or "secondary", never omit it or leave it blank.
