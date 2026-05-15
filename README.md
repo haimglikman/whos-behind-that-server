@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v1.7.1 — bug fix (server) | Main file: v1.11.0
+- Added pre-translation step: Hebrew/Arabic posts translated + summarized with political context before scoring
+- Fixes zero alignment on Hebrew settler/opposition posts that correctly identified entities in the vocabulary but failed to match
+- Translation runs only when >10 non-Latin characters detected — English posts unaffected
+
 ### v1.7.0 (server) | Main file: v1.11.0
 - Language-aware scoring: prompt now handles English, Hebrew, and Arabic with vocabulary glossary
 - Intra-coalition criticism rule: settler/Ben Gvir posts criticizing Netanyahu no longer flag Netanyahu as aligned
