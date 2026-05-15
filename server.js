@@ -5,11 +5,11 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.8.2 — Fixed Claude web search not actually calling the tool. Added
-//           tool_choice:any to force tool use, proper multi-turn handling
-//           for tool_use → tool_result → final answer flow.
+// v1.8.3 — Instagram auto-fetch removed — Instagram blocks all automated
+//           access including Claude web search. Instagram now shows manual
+//           paste field immediately. Facebook still uses Claude web search.
 //
-// v1.8.1 — Fixed Instagram/Facebook Claude web search response parsing.
+// v1.8.2 — Fixed Claude web search multi-turn tool use flow.
 //           Three-tier JSON extraction: clean parse → regex extract → raw text.
 //           Added debug logging to Render logs. Increased max_tokens to 2000.
 //
@@ -73,7 +73,7 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.8.2';
+const SERVER_VERSION = '1.8.3';
 
 import express from 'express';
 import cors from 'cors';
@@ -345,10 +345,12 @@ async function fetchFromX(url) {
 // FACEBOOK FETCHER
 // ─────────────────────────────────────────────
 // ─────────────────────────────────────────────
-// INSTAGRAM FETCHER — Claude web search
+// INSTAGRAM FETCHER — manual only
+// Instagram blocks all automated access including
+// Claude web search. Show manual text fallback.
 // ─────────────────────────────────────────────
 async function fetchFromInstagram(url) {
-  return await fetchWithClaudeWebSearch(url, 'Instagram');
+  throw new Error('Instagram posts cannot be fetched automatically. Please paste the post text manually.');
 }
 
 // ─────────────────────────────────────────────
@@ -442,7 +444,8 @@ After searching, extract the full post text and author information. Return JSON 
 
   const secondData = await secondResponse.json();
   const textContent = secondData.content.filter(c => c.type === 'text').map(c => c.text).join('');
-  console.log(`${platform} second turn content (first 300):`, textContent.slice(0, 300));
+  console.log(`${platform} second turn full content:`, JSON.stringify(secondData.content).slice(0, 500));
+  console.log(`${platform} second turn text (first 500):`, textContent.slice(0, 500));
   return extractPostFromText(textContent, platform);
 }
 
