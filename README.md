@@ -1,5 +1,11 @@
 # Who's Behind That? — Server Changelog
 
+### v1.9.0 (server) | Main file: v1.12.3
+- Instagram fetching now uses Puppeteer headless browser for full text extraction
+- Puppeteer executes JavaScript like a real browser, bypassing OpenGraph truncation
+- Falls back to OpenGraph scraping if Puppeteer fails
+- New dependency: puppeteer — update package.json alongside server.js
+
 ### v1.8.5 — bug fix (server) | Main file: v1.12.3
 - Added minimum text length check: fetched text under 200 chars triggers manual fallback
 - Prevents OpenGraph title-only results from being sent to scoring engine silently
