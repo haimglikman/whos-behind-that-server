@@ -5,6 +5,10 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.8.0 — Instagram and Facebook now fetched via Claude web_search tool.
+//           Replaces broken oEmbed + OpenGraph scraping. Falls back to
+//           manual text if post is private or login-gated.
+//
 // v1.7.1 — Pre-translation step for Hebrew/Arabic posts: non-English posts
 //           are translated + summarized with political context before batch
 //           scoring. Fixes zero alignment on Hebrew settler/opposition posts.
@@ -61,7 +65,7 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.7.1';
+const SERVER_VERSION = '1.8.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -343,30 +347,96 @@ async function fetchFromFacebook(url) {
 // ─────────────────────────────────────────────
 // INSTAGRAM FETCHER
 // ─────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// INSTAGRAM FETCHER — Claude web search
+// ─────────────────────────────────────────────
 async function fetchFromInstagram(url) {
-  const oembedUrl = `https://graph.facebook.com/v18.0/instagram_oembed?url=${encodeURIComponent(url)}&omitscript=true`;
-  const response = await fetch(oembedUrl, { headers: { 'User-Agent': 'WhoBehindThat/1.5' }, timeout: 10000 });
-  if (!response.ok) return await scrapeOpenGraph(url, 'instagram');
-  const data = await response.json();
-  const handleMatch = (data.author_url || '').match(/instagram\.com\/([^\/\?]+)/i);
-  const authorHandle = handleMatch ? handleMatch[1] : (data.author_name || null);
-  return { text: stripHtml(data.html || ''), author: data.author_name || null, authorHandle, html: data.html, source: 'oembed' };
+  return await fetchWithClaudeWebSearch(url, 'Instagram');
 }
 
 // ─────────────────────────────────────────────
-// OPEN GRAPH FALLBACK
+// FACEBOOK FETCHER — Claude web search
 // ─────────────────────────────────────────────
-async function scrapeOpenGraph(url, platform) {
-  const response = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)', 'Accept': 'text/html', 'Accept-Language': 'en-US,en;q=0.9' },
-    timeout: 12000
+async function fetchFromFacebook(url) {
+  return await fetchWithClaudeWebSearch(url, 'Facebook');
+}
+
+// ─────────────────────────────────────────────
+// CLAUDE WEB SEARCH FETCHER
+// Uses Claude's web_search tool to fetch and extract
+// post text from Instagram/Facebook public posts
+// ─────────────────────────────────────────────
+async function fetchWithClaudeWebSearch(url, platform) {
+  if (!ANTHROPIC_KEY) throw new Error('ANTHROPIC_API_KEY not configured');
+
+  const prompt = `Please fetch the content of this ${platform} post and extract:
+1. The full text/caption of the post
+2. The author's name or handle if visible
+3. The author's profile URL if visible
+
+Post URL: ${url}
+
+Respond ONLY with valid JSON:
+{
+  "text": "full post text here",
+  "author": "author name or null",
+  "authorHandle": "handle without @ or null",
+  "authorUrl": "profile URL or null"
+}
+
+If you cannot access the post (private, deleted, requires login), respond with:
+{
+  "text": null,
+  "error": "reason why"
+}`;
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 1000,
+      temperature: 0,
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      messages: [{ role: 'user', content: prompt }]
+    })
   });
-  if (!response.ok) throw new Error(`Could not access ${platform} post (HTTP ${response.status}). The post may be private or deleted.`);
-  const html = await response.text();
-  const $ = cheerio.load(html);
-  const text = $('meta[property="og:description"]').attr('content') || $('meta[name="twitter:description"]').attr('content') || $('meta[property="og:title"]').attr('content') || '';
-  if (!text) throw new Error(`Could not extract text from ${platform} post. It may require login to view.`);
-  return { text, author: null, source: 'opengraph' };
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error('Claude web search error: ' + (err.error?.message || response.status));
+  }
+
+  const data = await response.json();
+  // Extract text blocks from response (may include tool_use blocks)
+  const textContent = data.content
+    .filter(c => c.type === 'text')
+    .map(c => c.text || '')
+    .join('');
+
+  const clean = textContent.replace(/```json|```/g, '').trim();
+  let result;
+  try {
+    result = JSON.parse(clean);
+  } catch(e) {
+    throw new Error(`Could not parse Claude response for ${platform} post`);
+  }
+
+  if (!result.text) {
+    throw new Error(result.error || `Could not extract text from ${platform} post. It may be private or require login.`);
+  }
+
+  return {
+    text: result.text,
+    author: result.author || null,
+    authorHandle: result.authorHandle || null,
+    html: null,
+    source: 'claude_web_search'
+  };
 }
 
 // ─────────────────────────────────────────────
