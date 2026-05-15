@@ -5,6 +5,10 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.7.1 — Pre-translation step for Hebrew/Arabic posts: non-English posts
+//           are translated + summarized with political context before batch
+//           scoring. Fixes zero alignment on Hebrew settler/opposition posts.
+//
 // v1.7.0 — Language-aware scoring: prompt now explicitly handles English,
 //           Hebrew, and Arabic posts with key political vocabulary glossary.
 //           Intra-coalition criticism rule added to both scoring and coherence
@@ -57,7 +61,7 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.7.0';
+const SERVER_VERSION = '1.7.1';
 
 import express from 'express';
 import cors from 'cors';
@@ -370,10 +374,57 @@ async function scrapeOpenGraph(url, platform) {
 // ─────────────────────────────────────────────
 const BATCH_SIZE = 10;
 
+// Detect if text contains significant Hebrew or Arabic characters
+function isNonEnglish(text) {
+  const nonLatinChars = (text.match(/[\u0590-\u05FF\u0600-\u06FF]/g) || []).length;
+  return nonLatinChars > 10;
+}
+
+// Translate and summarize non-English post for scoring context
+async function translatePost(postText) {
+  const prompt = `The following social media post is written in Hebrew or Arabic. Provide:
+1. A full English translation
+2. A one-paragraph political context summary identifying: what is being argued, who is being addressed, what action is being demanded, and what political camp this language belongs to.
+
+POST TEXT:
+"${postText}"
+
+Respond ONLY with valid JSON:
+{
+  "translation": "...",
+  "political_context": "..."
+}`;
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 600, temperature: 0, messages: [{ role: 'user', content: prompt }] })
+  });
+  if (!response.ok) return null;
+  const data = await response.json();
+  const raw = data.content.map(c => c.text || '').join('').trim();
+  const clean = raw.replace(/```json|```/g, '').trim();
+  try { return JSON.parse(clean); } catch(e) { return null; }
+}
+
 async function scoreWithClaude(postText, entities) {
+  // Pre-translate non-English posts for better semantic matching
+  let enrichedText = postText;
+  if (isNonEnglish(postText)) {
+    try {
+      const translation = await translatePost(postText);
+      if (translation) {
+        enrichedText = `ORIGINAL TEXT:\n${postText}\n\nENGLISH TRANSLATION:\n${translation.translation}\n\nPOLITICAL CONTEXT:\n${translation.political_context}`;
+        console.log('Post translated for scoring. Political context:', translation.political_context.slice(0, 150));
+      }
+    } catch(e) {
+      console.warn('Translation failed, using original text:', e.message);
+    }
+  }
+
   const batches = [];
   for (let i = 0; i < entities.length; i += BATCH_SIZE) batches.push(entities.slice(i, i + BATCH_SIZE));
-  const batchResults = await Promise.all(batches.map(batch => scoreBatch(postText, batch)));
+  const batchResults = await Promise.all(batches.map(batch => scoreBatch(enrichedText, batch)));
   const allMatches = [];
   let text_ai_score = 5, text_ai_reason = '';
   for (const result of batchResults) {
@@ -390,15 +441,12 @@ async function scoreWithClaude(postText, entities) {
   let finalMatches = allMatches;
   if (candidates.length > 1) {
     try {
-      const coherent = await coherenceCheck(postText, candidates, entities);
-      // Replace candidate matches with coherence-filtered versions
+      const coherent = await coherenceCheck(enrichedText, candidates, entities);
       const coherentIds = new Set(coherent.map(m => m.id));
       finalMatches = allMatches.map(m => {
         if (!coherentIds.has(m.id) && m.pct >= 60) {
-          // Demoted by coherence check — zero out pct so it falls below threshold
           return Object.assign({}, m, { pct: Math.min(m.pct, 50), why: '', missing: '', alignment: '' });
         }
-        // Update with coherence-refined alignment/why/missing
         const refined = coherent.find(c => c.id === m.id);
         return refined ? Object.assign({}, m, refined) : m;
       });
