@@ -5,11 +5,12 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.8.3 — Instagram auto-fetch removed — Instagram blocks all automated
-//           access including Claude web search. Instagram now shows manual
-//           paste field immediately. Facebook still uses Claude web search.
+// v1.8.4 — Restored Instagram oEmbed + OpenGraph scraping (was working
+//           before v1.8.0 replaced it with Claude web search). Restored
+//           scrapeOpenGraph function. Manual fallback still shown if fetch
+//           fails.
 //
-// v1.8.2 — Fixed Claude web search multi-turn tool use flow.
+// v1.8.3 — Instagram auto-fetch removed (now restored).
 //           Three-tier JSON extraction: clean parse → regex extract → raw text.
 //           Added debug logging to Render logs. Increased max_tokens to 2000.
 //
@@ -73,7 +74,7 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.8.3';
+const SERVER_VERSION = '1.8.4';
 
 import express from 'express';
 import cors from 'cors';
@@ -345,12 +346,26 @@ async function fetchFromX(url) {
 // FACEBOOK FETCHER
 // ─────────────────────────────────────────────
 // ─────────────────────────────────────────────
-// INSTAGRAM FETCHER — manual only
-// Instagram blocks all automated access including
-// Claude web search. Show manual text fallback.
+// INSTAGRAM FETCHER — oEmbed + OpenGraph scraping
+// Works for public posts via meta tags
 // ─────────────────────────────────────────────
 async function fetchFromInstagram(url) {
-  throw new Error('Instagram posts cannot be fetched automatically. Please paste the post text manually.');
+  // Try oEmbed first
+  try {
+    const oembedUrl = `https://graph.facebook.com/v18.0/instagram_oembed?url=${encodeURIComponent(url)}&omitscript=true`;
+    const response = await fetch(oembedUrl, { headers: { 'User-Agent': 'WhoBehindThat/1.8' } });
+    if (response.ok) {
+      const data = await response.json();
+      if (data.html || data.title) {
+        const handleMatch = (data.author_url || '').match(/instagram\.com\/([^\/\?]+)/i);
+        const authorHandle = handleMatch ? handleMatch[1] : (data.author_name || null);
+        return { text: stripHtml(data.html || '') || data.title, author: data.author_name || null, authorHandle, html: data.html, source: 'oembed' };
+      }
+    }
+  } catch(e) { console.log('Instagram oEmbed failed, trying OpenGraph:', e.message); }
+
+  // Fall back to OpenGraph scraping
+  return await scrapeOpenGraph(url, 'instagram');
 }
 
 // ─────────────────────────────────────────────
@@ -361,7 +376,33 @@ async function fetchFromFacebook(url) {
 }
 
 // ─────────────────────────────────────────────
-// CLAUDE WEB SEARCH FETCHER
+// OPEN GRAPH SCRAPER
+// Fallback for Instagram and Facebook
+// ─────────────────────────────────────────────
+async function scrapeOpenGraph(url, platform) {
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+      'Accept': 'text/html,application/xhtml+xml',
+      'Accept-Language': 'en-US,en;q=0.9'
+    }
+  });
+  if (!response.ok) throw new Error(`Could not access ${platform} post (HTTP ${response.status}). The post may be private or deleted.`);
+  const html = await response.text();
+  const $ = cheerio.load(html);
+  const text =
+    $('meta[property="og:description"]').attr('content') ||
+    $('meta[name="twitter:description"]').attr('content') ||
+    $('meta[property="og:title"]').attr('content') || '';
+  if (!text) throw new Error(`Could not extract text from ${platform} post. It may require login to view.`);
+  // Try to extract author handle from page
+  const canonicalUrl = $('meta[property="og:url"]').attr('content') || url;
+  const handleMatch = canonicalUrl.match(/instagram\.com\/([^\/\?p][^\/\?]+)/i);
+  return { text, author: null, authorHandle: handleMatch ? handleMatch[1] : null, source: 'opengraph' };
+}
+
+// ─────────────────────────────────────────────
+// CLAUDE WEB SEARCH FETCHER (Facebook)
 // Uses Claude's web_search tool to fetch and extract
 // post text from Instagram/Facebook public posts
 // ─────────────────────────────────────────────
