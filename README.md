@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v1.8.4 — bug fix (server) | Main file: v1.12.3
+- Restored Instagram oEmbed + OpenGraph scraping that worked before v1.8.0
+- Restored scrapeOpenGraph function that was accidentally removed
+- Manual fallback still shown if fetch fails
+
 ### v1.8.3 — bug fix (server) | Main file: v1.12.1
 - Instagram auto-fetch removed — Instagram blocks all automated access
 - Facebook retains Claude web search auto-fetch
