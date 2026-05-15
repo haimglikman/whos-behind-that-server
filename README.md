@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v1.8.3 — bug fix (server) | Main file: v1.12.1
+- Instagram auto-fetch removed — Instagram blocks all automated access
+- Facebook retains Claude web search auto-fetch
+
 ### v1.8.2 — bug fix (server) | Main file: v1.12.0
 - Fixed Claude web search not actually calling the tool (was responding from memory)
 - Added tool_choice: any to force tool use before responding
