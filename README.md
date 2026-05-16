@@ -1,5 +1,11 @@
 # Who's Behind That? — Server Changelog
 
+### v1.10.0 (server) | Main file: v1.13.0
+- POST /convergent-interest endpoint: finds hidden shared interests between rival entities
+- History filters via query params on GET /history/list
+- Platform column added to scans table (ALTER TABLE adds it to existing tables)
+- history/save now stores platform field
+
 ### v1.9.0 (server) | Main file: v1.12.3
 - Instagram fetching now uses Puppeteer headless browser for full text extraction
 - Puppeteer executes JavaScript like a real browser, bypassing OpenGraph truncation
