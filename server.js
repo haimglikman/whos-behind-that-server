@@ -5,6 +5,12 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v2.0.0 — Convergent interest detection via /convergent-interest endpoint.
+//           High bar: returns at most one pair, only when analytically
+//           defensible. History filters: platform, version, entity, date
+//           range, score, text AI, has comment, alignment type.
+//           Added platform column to scans table.
+//
 // v1.9.0 — Instagram fetching now uses Puppeteer headless browser to
 //           execute JavaScript and extract full post text. Falls back to
 //           OpenGraph scraping if Puppeteer fails. New dependency: puppeteer.
@@ -73,7 +79,7 @@
 // v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.9.0';
+const SERVER_VERSION = '2.0.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -127,7 +133,6 @@ app.use(express.json({ limit: '2mb' }));
 async function initDB() {
   if (!db) { console.warn('Skipping DB init — no pool available'); return; }
   try {
-    // Test the connection first
     await db.query('SELECT 1');
     console.log('PostgreSQL connection test passed.');
     await db.query(`
@@ -135,6 +140,7 @@ async function initDB() {
         id TEXT PRIMARY KEY,
         ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         url TEXT NOT NULL,
+        platform TEXT,
         post_text TEXT,
         overall_score INTEGER,
         overall_label TEXT,
@@ -147,10 +153,12 @@ async function initDB() {
         full_result JSONB
       );
     `);
+    // Add platform column to existing tables that don't have it
+    await db.query(`ALTER TABLE scans ADD COLUMN IF NOT EXISTS platform TEXT;`);
     console.log('Database ready. Table scans exists or was created.');
   } catch (err) {
     console.error('DB init error:', err.message);
-    db = null; // disable DB if it fails
+    db = null;
   }
 }
 
@@ -241,19 +249,17 @@ app.post('/research-actor', async (req, res) => {
 
 // ─────────────────────────────────────────────
 // POST /history/save
-// Saves a completed scan to the shared database
-// Body: full scan entry object from frontend
 // ─────────────────────────────────────────────
 app.post('/history/save', async (req, res) => {
   if (!db) return res.status(503).json({ error: 'Database not configured' });
-  const { id, ts, url, postText, overallScore, overallLabel, topMatches, textAI, hasImage, appVersion, serverVersion, fullResult } = req.body;
+  const { id, ts, url, platform, postText, overallScore, overallLabel, topMatches, textAI, hasImage, appVersion, serverVersion, fullResult } = req.body;
   if (!id || !url) return res.status(400).json({ error: 'id and url are required' });
   try {
     await db.query(
-      `INSERT INTO scans (id, ts, url, post_text, overall_score, overall_label, top_matches, text_ai, has_image, app_version, server_version, comment, full_result)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, '', $12)
+      `INSERT INTO scans (id, ts, url, platform, post_text, overall_score, overall_label, top_matches, text_ai, has_image, app_version, server_version, comment, full_result)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, '', $13)
        ON CONFLICT (id) DO NOTHING`,
-      [id, ts || new Date().toISOString(), url, postText || '', overallScore || 0, overallLabel || '', topMatches || [], textAI || 5, hasImage || false, appVersion || '', serverVersion || '', fullResult ? JSON.stringify(fullResult) : null]
+      [id, ts || new Date().toISOString(), url, platform || null, postText || '', overallScore || 0, overallLabel || '', topMatches || [], textAI || 5, hasImage || false, appVersion || '', serverVersion || '', fullResult ? JSON.stringify(fullResult) : null]
     );
     res.json({ success: true, id });
   } catch (err) {
@@ -264,31 +270,46 @@ app.post('/history/save', async (req, res) => {
 
 // ─────────────────────────────────────────────
 // GET /history/list
-// Returns all scans, newest first
+// Supports query params: platform, appVersion, serverVersion,
+// entity, dateFrom, dateTo, minScore, maxScore, minTextAI,
+// hasComment, alignmentType
 // ─────────────────────────────────────────────
 app.get('/history/list', async (req, res) => {
   if (!db) return res.status(503).json({ error: 'Database not configured' });
   try {
+    const { platform, appVersion, serverVersion, entity, dateFrom, dateTo, minScore, maxScore, minTextAI, hasComment, alignmentType } = req.query;
+    let where = [];
+    let params = [];
+    let idx = 1;
+    if (platform) { where.push(`platform = $${idx++}`); params.push(platform); }
+    if (appVersion) { where.push(`app_version = $${idx++}`); params.push(appVersion); }
+    if (serverVersion) { where.push(`server_version = $${idx++}`); params.push(serverVersion); }
+    if (entity) { where.push(`$${idx++} = ANY(top_matches)`); params.push(entity); }
+    if (dateFrom) { where.push(`ts >= $${idx++}`); params.push(dateFrom); }
+    if (dateTo) { where.push(`ts <= $${idx++}`); params.push(dateTo); }
+    if (minScore) { where.push(`overall_score >= $${idx++}`); params.push(parseInt(minScore)); }
+    if (maxScore) { where.push(`overall_score <= $${idx++}`); params.push(parseInt(maxScore)); }
+    if (minTextAI) { where.push(`text_ai >= $${idx++}`); params.push(parseInt(minTextAI)); }
+    if (hasComment === 'true') { where.push(`comment != ''`); }
+    const whereClause = where.length ? 'WHERE ' + where.join(' AND ') : '';
     const result = await db.query(
-      `SELECT id, ts, url, post_text, overall_score, overall_label, top_matches, text_ai, has_image, app_version, server_version, comment, full_result
-       FROM scans ORDER BY ts DESC LIMIT 500`
+      `SELECT id, ts, url, platform, post_text, overall_score, overall_label, top_matches, text_ai, has_image, app_version, server_version, comment, full_result
+       FROM scans ${whereClause} ORDER BY ts DESC LIMIT 500`,
+      params
     );
     const rows = result.rows.map(r => ({
-      id: r.id,
-      ts: r.ts,
-      url: r.url,
-      postText: r.post_text,
-      overallScore: r.overall_score,
-      overallLabel: r.overall_label,
-      topMatches: r.top_matches,
-      textAI: r.text_ai,
-      hasImage: r.has_image,
-      appVersion: r.app_version,
-      serverVersion: r.server_version,
-      comment: r.comment || '',
-      fullResult: r.full_result
+      id: r.id, ts: r.ts, url: r.url, platform: r.platform,
+      postText: r.post_text, overallScore: r.overall_score,
+      overallLabel: r.overall_label, topMatches: r.top_matches,
+      textAI: r.text_ai, hasImage: r.has_image,
+      appVersion: r.app_version, serverVersion: r.server_version,
+      comment: r.comment || '', fullResult: r.full_result
     }));
-    res.json({ success: true, scans: rows });
+    // Client-side alignment type filter (needs full_result)
+    let filtered = rows;
+    if (alignmentType === 'primary') filtered = rows.filter(r => r.fullResult?.matches?.some(m => !m.secondary));
+    if (alignmentType === 'secondary') filtered = rows.filter(r => r.fullResult?.matches?.some(m => m.secondary));
+    res.json({ success: true, scans: filtered });
   } catch (err) {
     console.error('history/list error:', err.message);
     res.status(500).json({ error: err.message });
@@ -297,8 +318,6 @@ app.get('/history/list', async (req, res) => {
 
 // ─────────────────────────────────────────────
 // PATCH /history/comment
-// Updates the comment on a scan
-// Body: { id, comment }
 // ─────────────────────────────────────────────
 app.patch('/history/comment', async (req, res) => {
   if (!db) return res.status(503).json({ error: 'Database not configured' });
@@ -314,8 +333,87 @@ app.patch('/history/comment', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// PLATFORM DETECTION
+// POST /convergent-interest
+// Given post text + primary matches, finds hidden
+// convergent interests between entities (including rivals)
+// Returns at most ONE pair — the most significant only
 // ─────────────────────────────────────────────
+app.post('/convergent-interest', async (req, res) => {
+  const { postText, primaryMatches, allEntities } = req.body;
+  if (!postText || !primaryMatches || !allEntities) return res.status(400).json({ error: 'postText, primaryMatches, allEntities required' });
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured' });
+  try {
+    const result = await findConvergentInterest(postText, primaryMatches, allEntities);
+    res.json({ success: true, convergent: result });
+  } catch (err) {
+    console.error('convergent-interest error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+async function findConvergentInterest(postText, primaryMatches, allEntities) {
+  // Build entity interest summaries for all entities
+  const entitySummaries = allEntities.map(e =>
+    `ID:${e.id} NAME:${e.name}\nHIDDEN INTEREST: ${(e.interest||'').slice(0,200)}`
+  ).join('\n---\n');
+
+  const primaryNames = primaryMatches.map(m => m.name).join(', ');
+
+  const prompt = `You are a senior geopolitical analyst. A social media post has been analyzed and found to primarily serve: ${primaryNames}.
+
+Your task: identify whether this post ALSO touches on a hidden convergent interest between two entities that would NOT normally be expected to align — including rivals or enemies. This is NOT about additional alignment with the post's primary narrative. It is about a SPECIFIC OUTCOME that this post being spread might produce that two otherwise-unrelated or rival entities would both quietly welcome.
+
+REQUIREMENTS (all must be met — if any fail, return null):
+1. The two entities must have genuinely different or opposing primary interests
+2. The convergent interest must be SPECIFIC to THIS POST — not a general overlap
+3. You must be able to name the exact shared outcome in one sentence
+4. The connection must be analytically defensible, not conspiratorial speculation
+5. At least one of the entities should NOT already appear in the primary matches
+
+SOCIAL MEDIA POST:
+"${postText}"
+
+ENTITY DATABASE:
+${entitySummaries}
+
+Think carefully. Most posts do NOT have a meaningful convergent interest — if you cannot find one that meets ALL requirements, return null. Do NOT force a connection.
+
+Examples of legitimate convergent interests:
+- Netanyahu + Hamas: both benefit from the absence of a viable two-state solution
+- Israel + Saudi Arabia: both want Iran's proxy network degraded
+- Russia + Iran: both benefit from U.S. regional credibility being undermined
+
+Examples of illegitimate connections to AVOID:
+- Two entities that simply both oppose Israel (that's coalition, not convergent)
+- A general "both want peace" claim (too vague)
+- Any connection that requires more than 2 inferential steps
+
+Respond ONLY with valid JSON:
+{
+  "found": true,
+  "entityA": { "id": 1, "name": "..." },
+  "entityB": { "id": 3, "name": "..." },
+  "sharedOutcome": "One sentence: what specific outcome do both quietly want from this post being spread?",
+  "explanation": "2-3 sentences explaining the convergence, citing the post text and each entity's hidden interest",
+  "isRivals": true
+}
+
+Or if no valid convergent interest exists:
+{ "found": false }`;
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 600, temperature: 0, messages: [{ role: 'user', content: prompt }] })
+  });
+  if (!response.ok) { const err = await response.json().catch(()=>({})); throw new Error('Claude API error: ' + (err.error?.message || response.status)); }
+  const data = await response.json();
+  const raw = data.content.map(c => c.text || '').join('').trim();
+  const clean = raw.replace(/```json|```/g, '').trim();
+  return JSON.parse(clean);
+}
+
+
 function detectPlatform(url) {
   if (/x\.com|twitter\.com/i.test(url)) return 'x';
   if (/facebook\.com|fb\.com/i.test(url)) return 'facebook';
