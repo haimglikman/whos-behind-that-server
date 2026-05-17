@@ -5,11 +5,10 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.10.2 — Convergent interest threshold raised significantly: confidence
-//            score required, explicit anti-examples added to prompt (Ben Gvir
-//            + Iran flagged as illegitimate). Only shows if confidence >= 9/10.
+// v1.10.3 — Facebook fetcher switched from Claude web search to OpenGraph
+//            scraping (same as Instagram). More reliable for public posts.
 //
-// v1.10.1 — Removed Puppeteer. Added /convergent-interest endpoint.
+// v1.10.2 — Convergent interest threshold raised.
 //
 // v1.9.0  — Instagram fetching via Puppeteer headless browser. Restored
 //            oEmbed + OpenGraph scraping with 200-char minimum check.
@@ -39,7 +38,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.10.2';
+const SERVER_VERSION = '1.10.3';
 
 import express from 'express';
 import cors from 'cors';
@@ -408,7 +407,6 @@ async function fetchFromX(url) {
 }
 
 // ─────────────────────────────────────────────
-// FACEBOOK FETCHER
 // ─────────────────────────────────────────────
 // INSTAGRAM FETCHER — OpenGraph scraping
 // Puppeteer removed (caused Render build failures).
@@ -419,10 +417,12 @@ async function fetchFromInstagram(url) {
 }
 
 // ─────────────────────────────────────────────
-// FACEBOOK FETCHER — Claude web search
+// FACEBOOK FETCHER — OpenGraph scraping
+// Same approach as Instagram. Works for public
+// posts/pages via og:description meta tag.
 // ─────────────────────────────────────────────
 async function fetchFromFacebook(url) {
-  return await fetchWithClaudeWebSearch(url, 'Facebook');
+  return await scrapeOpenGraph(url, 'facebook');
 }
 
 // ─────────────────────────────────────────────
