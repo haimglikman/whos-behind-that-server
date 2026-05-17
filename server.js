@@ -5,11 +5,11 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.10.1 — Convergent interest detection via /convergent-interest endpoint.
-//            Switched to puppeteer to puppeteer-core — fixes Render build
-//            failure (no bundled Chromium). Auto-detects system Chrome path.
-//            History filters: platform, version, entity, date range, score,
-//            text AI, has comment, alignment type. Platform column added to DB.
+// v1.10.2 — Convergent interest threshold raised significantly: confidence
+//            score required, explicit anti-examples added to prompt (Ben Gvir
+//            + Iran flagged as illegitimate). Only shows if confidence >= 9/10.
+//
+// v1.10.1 — Removed Puppeteer. Added /convergent-interest endpoint.
 //
 // v1.9.0  — Instagram fetching via Puppeteer headless browser. Restored
 //            oEmbed + OpenGraph scraping with 200-char minimum check.
@@ -39,14 +39,13 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.10.1';
+const SERVER_VERSION = '1.10.2';
 
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
 import pg from 'pg';
-import puppeteer from 'puppeteer-core';
 
 const { Pool } = pg;
 const app = express();
@@ -312,23 +311,37 @@ app.post('/convergent-interest', async (req, res) => {
 });
 
 async function findConvergentInterest(postText, primaryMatches, allEntities) {
-  // Build entity interest summaries for all entities
   const entitySummaries = allEntities.map(e =>
     `ID:${e.id} NAME:${e.name}\nHIDDEN INTEREST: ${(e.interest||'').slice(0,200)}`
   ).join('\n---\n');
 
   const primaryNames = primaryMatches.map(m => m.name).join(', ');
 
-  const prompt = `You are a senior geopolitical analyst. A social media post has been analyzed and found to primarily serve: ${primaryNames}.
+  const prompt = `You are a senior geopolitical analyst. A social media post primarily serves: ${primaryNames}.
 
-Your task: identify whether this post ALSO touches on a hidden convergent interest between two entities that would NOT normally be expected to align — including rivals or enemies. This is NOT about additional alignment with the post's primary narrative. It is about a SPECIFIC OUTCOME that this post being spread might produce that two otherwise-unrelated or rival entities would both quietly welcome.
+Your task: identify whether this post touches on a RARE, SPECIFIC, HIGH-CONFIDENCE convergent interest between two entities that are NOT normally aligned — including rivals or enemies.
 
-REQUIREMENTS (all must be met — if any fail, return null):
-1. The two entities must have genuinely different or opposing primary interests
-2. The convergent interest must be SPECIFIC to THIS POST — not a general overlap
-3. You must be able to name the exact shared outcome in one sentence
-4. The connection must be analytically defensible, not conspiratorial speculation
-5. At least one of the entities should NOT already appear in the primary matches
+THIS IS A HIGH BAR. The vast majority of posts should return { "found": false }. Only flag a convergent interest if you are highly confident (9/10 or above) that a neutral senior analyst would immediately agree with your assessment without hesitation.
+
+STRICT REQUIREMENTS — ALL must be met:
+1. The two entities must have genuinely opposing primary interests on most issues
+2. The convergent interest must be DIRECTLY caused by THIS SPECIFIC POST — not a general structural overlap
+3. The shared outcome must be named in one precise sentence, citing specific post content
+4. The connection requires zero inferential leaps — it must be immediately obvious
+5. At least one entity must NOT appear in the primary matches
+6. The connection cannot be explained by coalition membership or general ideological overlap
+
+EXPLICIT ANTI-EXAMPLES — these are NOT convergent interests:
+- Ben Gvir/Smotrich + Iran: they are absolute enemies. The fact that both oppose a two-state solution is NOT convergent — their reasons, methods and goals are completely incompatible. Do NOT flag this.
+- Any two entities that both "oppose" something (opposition is not convergence)
+- Entities that benefit from "instability" in general (too vague)
+- Rival entities where the connection requires assuming what each entity "secretly wants"
+- Any pair where the connection would be dismissed as conspiratorial by a mainstream analyst
+
+LEGITIMATE EXAMPLES (rare cases that actually meet the bar):
+- Netanyahu + Hamas: both have structurally benefited from each other remaining in power, preventing a two-state solution — this is documented by Israeli analysts
+- Israel + Saudi Arabia: documented secret security cooperation against Iran
+- Russia + Iran: documented military cooperation on drones and weapons
 
 SOCIAL MEDIA POST:
 "${postText}"
@@ -336,30 +349,20 @@ SOCIAL MEDIA POST:
 ENTITY DATABASE:
 ${entitySummaries}
 
-Think carefully. Most posts do NOT have a meaningful convergent interest — if you cannot find one that meets ALL requirements, return null. Do NOT force a connection.
-
-Examples of legitimate convergent interests:
-- Netanyahu + Hamas: both benefit from the absence of a viable two-state solution
-- Israel + Saudi Arabia: both want Iran's proxy network degraded
-- Russia + Iran: both benefit from U.S. regional credibility being undermined
-
-Examples of illegitimate connections to AVOID:
-- Two entities that simply both oppose Israel (that's coalition, not convergent)
-- A general "both want peace" claim (too vague)
-- Any connection that requires more than 2 inferential steps
+Before responding, ask yourself: "Would a Haaretz or Foreign Affairs editor immediately agree with this connection, or would they call it a stretch?" If any doubt — return { "found": false }.
 
 Respond ONLY with valid JSON:
 {
   "found": true,
+  "confidence": 9,
   "entityA": { "id": 1, "name": "..." },
   "entityB": { "id": 3, "name": "..." },
-  "sharedOutcome": "One sentence: what specific outcome do both quietly want from this post being spread?",
-  "explanation": "2-3 sentences explaining the convergence, citing the post text and each entity's hidden interest",
+  "sharedOutcome": "Precise one sentence citing specific post content",
+  "explanation": "2-3 sentences. Must cite specific post phrases and each entity's documented interest.",
   "isRivals": true
 }
 
-Or if no valid convergent interest exists:
-{ "found": false }`;
+Or: { "found": false }`;
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -370,7 +373,10 @@ Or if no valid convergent interest exists:
   const data = await response.json();
   const raw = data.content.map(c => c.text || '').join('').trim();
   const clean = raw.replace(/```json|```/g, '').trim();
-  return JSON.parse(clean);
+  const result = JSON.parse(clean);
+  // Extra safety: only show if confidence >= 9
+  if (result.found && (result.confidence || 0) < 9) return { found: false };
+  return result;
 }
 
 
@@ -404,114 +410,12 @@ async function fetchFromX(url) {
 // ─────────────────────────────────────────────
 // FACEBOOK FETCHER
 // ─────────────────────────────────────────────
-// INSTAGRAM FETCHER — Puppeteer headless browser
-// Uses real browser to execute JS and get full text
-// Falls back to OpenGraph if Puppeteer fails
+// INSTAGRAM FETCHER — OpenGraph scraping
+// Puppeteer removed (caused Render build failures).
+// Falls back to manual text if fetch is too short.
 // ─────────────────────────────────────────────
 async function fetchFromInstagram(url) {
-  try {
-    return await fetchInstagramWithPuppeteer(url);
-  } catch(e) {
-    console.log('Puppeteer failed, trying OpenGraph:', e.message);
-  }
   return await scrapeOpenGraph(url, 'instagram');
-}
-
-async function fetchInstagramWithPuppeteer(url) {
-  let browser;
-  // Find Chrome executable
-  const chromePaths = [
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-    '/usr/bin/google-chrome-stable',
-    '/usr/bin/google-chrome',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/chromium',
-    '/snap/bin/chromium'
-  ].filter(Boolean);
-
-  let executablePath;
-  for (const p of chromePaths) {
-    try {
-      const { execSync } = await import('child_process');
-      execSync(`test -f ${p}`);
-      executablePath = p;
-      break;
-    } catch(e) {}
-  }
-
-  if (!executablePath) throw new Error('No Chrome/Chromium found on system. Set PUPPETEER_EXECUTABLE_PATH env var.');
-  try {
-    browser = await puppeteer.launch({
-      headless: true,
-      executablePath,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
-        '--disable-gpu',
-        '--disable-blink-features=AutomationControlled'
-      ]
-    });
-
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1');
-    await page.setViewport({ width: 390, height: 844, isMobile: true });
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'en-US,en;q=0.9,he;q=0.8,ar;q=0.7',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-    });
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
-
-    console.log('Puppeteer navigating to:', url);
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 25000 });
-    await page.waitForSelector('article, [role="presentation"], ._aagv', { timeout: 10000 }).catch(() => {});
-
-    const postText = await page.evaluate(() => {
-      const selectors = [
-        'article h1',
-        'article span',
-        '._aagv span',
-        '._a9zs span',
-        'meta[property="og:description"]',
-        'meta[name="description"]'
-      ];
-      for (const sel of selectors) {
-        if (sel.startsWith('meta')) {
-          const el = document.querySelector(sel);
-          if (el && el.content && el.content.length > 50) return el.content;
-        } else {
-          const els = document.querySelectorAll(sel);
-          for (const el of els) {
-            const text = (el.innerText || el.textContent || '').trim();
-            if (text.length > 50) return text;
-          }
-        }
-      }
-      const og = document.querySelector('meta[property="og:description"]');
-      return og ? og.content : null;
-    });
-
-    const authorHandle = await page.evaluate(() => {
-      const canonical = document.querySelector('link[rel="canonical"]');
-      if (canonical) {
-        const m = canonical.href.match(/instagram\.com\/([^\/\?]+)\//);
-        if (m) return m[1];
-      }
-      return null;
-    });
-
-    console.log(`Puppeteer extracted ${postText ? postText.length : 0} chars`);
-    if (!postText || postText.length < 30) throw new Error('Insufficient text — Instagram may have shown login wall');
-    return { text: postText, author: null, authorHandle, html: null, source: 'puppeteer' };
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
 }
 
 // ─────────────────────────────────────────────
