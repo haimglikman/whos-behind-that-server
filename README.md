@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v1.10.3 — bug fix (server) | Main file: v1.13.1
+- Facebook fetcher switched from Claude web search to OpenGraph scraping
+- More reliable for public posts, no extra API cost
+- Instagram fetcher unchanged
+
 ### v1.10.2 — bug fix (server) | Main file: v1.13.1
 - Convergent interest threshold raised: confidence ≥ 9/10 required
 - Explicit anti-examples added to prompt (Ben Gvir + Iran = illegitimate)
