@@ -5,10 +5,11 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.10.3 — Facebook fetcher switched from Claude web search to OpenGraph
-//            scraping (same as Instagram). More reliable for public posts.
+// v1.10.4 — Facebook/Instagram: follow redirects (fixes share URLs like
+//            facebook.com/share/r/...). Added meta[name="description"]
+//            fallback. Lowered min text threshold from 200 to 100 chars.
 //
-// v1.10.2 — Convergent interest threshold raised.
+// v1.10.3 — Facebook switched to OpenGraph scraping.
 //
 // v1.9.0  — Instagram fetching via Puppeteer headless browser. Restored
 //            oEmbed + OpenGraph scraping with 200-char minimum check.
@@ -38,7 +39,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.10.3';
+const SERVER_VERSION = '1.10.4';
 
 import express from 'express';
 import cors from 'cors';
@@ -180,7 +181,7 @@ app.post('/fetch-and-analyze', async (req, res) => {
     else if (platform === 'facebook') postData = await fetchFromFacebook(url);
     else if (platform === 'instagram') postData = await fetchFromInstagram(url);
     if (!postData.text) return res.status(422).json({ error: 'Could not extract post text. The post may be private or the platform may be blocking access.' });
-    if (postData.text.length < 200) return res.status(422).json({ error: `Fetched text is too short (${postData.text.length} chars) — OpenGraph likely returned only a title or preview. Please paste the full post text manually.` });
+    if (postData.text.length < 100) return res.status(422).json({ error: `Fetched text is too short (${postData.text.length} chars) — the platform may have returned only a title or preview. Please paste the full post text manually.` });
     const analysis = await scoreWithClaude(postData.text, entities);
     res.json({ success: true, platform, post: postData, analysis });
   } catch (err) {
@@ -434,8 +435,9 @@ async function scrapeOpenGraph(url, platform) {
     headers: {
       'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
       'Accept': 'text/html,application/xhtml+xml',
-      'Accept-Language': 'en-US,en;q=0.9'
-    }
+      'Accept-Language': 'en-US,en;q=0.9,he;q=0.8,ar;q=0.7'
+    },
+    redirect: 'follow'
   });
   if (!response.ok) throw new Error(`Could not access ${platform} post (HTTP ${response.status}). The post may be private or deleted.`);
   const html = await response.text();
@@ -443,11 +445,11 @@ async function scrapeOpenGraph(url, platform) {
   const text =
     $('meta[property="og:description"]').attr('content') ||
     $('meta[name="twitter:description"]').attr('content') ||
-    $('meta[property="og:title"]').attr('content') || '';
+    $('meta[property="og:title"]').attr('content') ||
+    $('meta[name="description"]').attr('content') || '';
   if (!text) throw new Error(`Could not extract text from ${platform} post. It may require login to view.`);
-  // Try to extract author handle from page
-  const canonicalUrl = $('meta[property="og:url"]').attr('content') || url;
-  const handleMatch = canonicalUrl.match(/instagram\.com\/([^\/\?p][^\/\?]+)/i);
+  const canonicalUrl = $('link[rel="canonical"]').attr('href') || $('meta[property="og:url"]').attr('content') || url;
+  const handleMatch = canonicalUrl.match(/(?:instagram|facebook)\.com\/([^\/\?p][^\/\?]+)/i);
   return { text, author: null, authorHandle: handleMatch ? handleMatch[1] : null, source: 'opengraph' };
 }
 
