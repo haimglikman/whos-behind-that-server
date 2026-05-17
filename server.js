@@ -5,88 +5,48 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v2.0.0 — Convergent interest detection via /convergent-interest endpoint.
-//           High bar: returns at most one pair, only when analytically
-//           defensible. History filters: platform, version, entity, date
-//           range, score, text AI, has comment, alignment type.
-//           Added platform column to scans table.
+// v1.10.1 — Convergent interest detection via /convergent-interest endpoint.
+//            Switched to puppeteer to puppeteer-core — fixes Render build
+//            failure (no bundled Chromium). Auto-detects system Chrome path.
+//            History filters: platform, version, entity, date range, score,
+//            text AI, has comment, alignment type. Platform column added to DB.
 //
-// v1.9.0 — Instagram fetching now uses Puppeteer headless browser to
-//           execute JavaScript and extract full post text. Falls back to
-//           OpenGraph scraping if Puppeteer fails. New dependency: puppeteer.
+// v1.9.0  — Instagram fetching via Puppeteer headless browser. Restored
+//            oEmbed + OpenGraph scraping with 200-char minimum check.
+//            Pre-translation for Hebrew/Arabic. Language-aware scoring.
+//            Intra-coalition criticism rule. Entity relationship modeling
+//            + coherence check. All changes from app v1.10.x–v1.12.x.
 //
-// v1.8.5 — Added minimum text length check after fetch.
-//           Three-tier JSON extraction: clean parse → regex extract → raw text.
-//           Added debug logging to Render logs. Increased max_tokens to 2000.
+// v1.8.0  — Added /research-actor endpoint (Claude OSINT actor lookup).
 //
-// v1.8.0 — Instagram and Facebook now fetched via Claude web_search tool.
-//           Replaces broken oEmbed + OpenGraph scraping. Falls back to
-//           manual text if post is private or login-gated.
+// v1.7.0  — Primary/secondary alignment distinction. "Criticism ≠ alignment"
+//            rule. alignment field mandatory on all matches.
 //
-// v1.7.1 — Pre-translation step for Hebrew/Arabic posts: non-English posts
-//           are translated + summarized with political context before batch
-//           scoring. Fixes zero alignment on Hebrew settler/opposition posts.
+// v1.6.0  — Batched scoring (10 per call), temperature:0, threshold 60%.
 //
-// v1.7.0 — Language-aware scoring: prompt now explicitly handles English,
-//           Hebrew, and Arabic posts with key political vocabulary glossary.
-//           Intra-coalition criticism rule added to both scoring and coherence
-//           prompts: Ben Gvir/settler posts criticizing Netanyahu no longer
-//           flag Netanyahu as aligned. Coherence check updated with finer
-//           coalition distinction logic.
+// v1.5.1  — Fixed PostgreSQL silent connection failure.
 //
-// v1.6.0 — Entity relationship modeling + coherence check. After batch
-//           scoring, a second Claude call filters out rival-bloc entities.
-//           A post serving Israeli opposition no longer flags Iran/Hamas.
+// v1.5.0  — Shared history via PostgreSQL. /history/save, /history/list,
+//            /history/comment. Scan IDs. Version tracking. Comments field.
 //
-// v1.5.1 — Fixed PostgreSQL connection: better error handling and logging,
-//           test query on startup, db=null if connection fails so server
-//           still starts. Helps diagnose DATABASE_URL issues on Render.
+// v1.4.0  — Scoring prompt rewritten to narrative alignment framing.
+//            Added "missing" context field per entity match.
 //
-// v1.5.0 — Shared history via PostgreSQL. New endpoints: /history/save,
-//           /history/list, /history/comment. Scan IDs in format
-//           WBT-{date}-{appVer}-{srvVer}-{random}. App + server version
-//           logged per scan. Comments field per scan, server-synced.
-//           Auto-creates scans table on first run.
+// v1.3.0  — Scoring weights: interest 55%, MO 35%, narrative 10%.
 //
-// v1.4.1 — Fixed two scoring bugs: (1) "alignment" field now mandatory in
-//           prompt — Claude was omitting it causing all matches to show as
-//           primary. (2) Added explicit "criticism ≠ alignment" rule — a post
-//           attacking Netanyahu no longer incorrectly scores as Netanyahu-aligned.
+// v1.2.0  — Core scoring engine: /fetch-and-analyze, /analyze, /fetch-post.
 //
-// v1.4.0 — Added primary/secondary alignment distinction. Primary = entity
-//           the post was likely written to serve. Secondary = indirect
-//           collateral beneficiary. Both require 85%+ threshold.
-//           Max 3 primary, 2 secondary matches returned.
-//
-// v1.3.1 — Fixed Instagram actor research: extract authorHandle from oEmbed
-//           author_url so the "research this actor" prompt appears after
-//           analyzing Instagram posts (handle not present in post URLs).
-//
-// v1.3.0 — Batched scoring (10 entities per call), temperature: 0 for
-//           deterministic output, internal threshold lowered to 60%.
-//
-// v1.2.2 — Added SERVER_VERSION constant and changelog comment block.
-//
-// v1.2.1 — Fixed missing app.listen() line causing Render deploy failure.
-//
-// v1.2.0 — Added /research-actor endpoint (Claude OSINT actor lookup).
-//
-// v1.1.1 — Updated scoring weights: interest 55%, MO 35%, narrative 10%.
-//
-// v1.1.0 — Scoring prompt rewritten to narrative alignment framing;
-//           added "missing" context field per entity match.
-//
-// v1.0.0 — Initial server: fetching, Claude scoring engine, all endpoints.
+// v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '2.0.0';
+const SERVER_VERSION = '1.10.1';
 
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
 import pg from 'pg';
-import puppeteer from 'puppeteer';
+import puppeteer from 'puppeteer-core';
 
 const { Pool } = pg;
 const app = express();
@@ -459,9 +419,31 @@ async function fetchFromInstagram(url) {
 
 async function fetchInstagramWithPuppeteer(url) {
   let browser;
+  // Find Chrome executable
+  const chromePaths = [
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/snap/bin/chromium'
+  ].filter(Boolean);
+
+  let executablePath;
+  for (const p of chromePaths) {
+    try {
+      const { execSync } = await import('child_process');
+      execSync(`test -f ${p}`);
+      executablePath = p;
+      break;
+    } catch(e) {}
+  }
+
+  if (!executablePath) throw new Error('No Chrome/Chromium found on system. Set PUPPETEER_EXECUTABLE_PATH env var.');
   try {
     browser = await puppeteer.launch({
       headless: true,
+      executablePath,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
