@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v1.10.4 — bug fix (server) | Main file: v1.13.2
+- OpenGraph scraper follows redirects — fixes Facebook share URLs
+- Added meta[name="description"] fallback
+- Minimum text threshold lowered from 200 to 100 chars
+
 ### v1.10.3 — bug fix (server) | Main file: v1.13.1
 - Facebook fetcher switched from Claude web search to OpenGraph scraping
 - More reliable for public posts, no extra API cost
