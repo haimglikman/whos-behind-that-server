@@ -5,11 +5,13 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.10.4 — Facebook/Instagram: follow redirects (fixes share URLs like
-//            facebook.com/share/r/...). Added meta[name="description"]
-//            fallback. Lowered min text threshold from 200 to 100 chars.
+// v1.11.0 — Added source ('admin'/'client') and device_id fields to scans
+//            table. history/save accepts source + deviceId. history/list
+//            supports source and deviceId filter params. device_id hashed
+//            to usr_XXXX for privacy in list responses. clientUsers array
+//            returned for admin filter dropdown.
 //
-// v1.10.3 — Facebook switched to OpenGraph scraping.
+// v1.10.4 — Facebook/Instagram redirect following, lower min text threshold.
 //
 // v1.9.0  — Instagram fetching via Puppeteer headless browser. Restored
 //            oEmbed + OpenGraph scraping with 200-char minimum check.
@@ -39,7 +41,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.10.4';
+const SERVER_VERSION = '1.11.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -100,6 +102,8 @@ async function initDB() {
         ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         url TEXT NOT NULL,
         platform TEXT,
+        source TEXT DEFAULT 'admin',
+        device_id TEXT,
         post_text TEXT,
         overall_score INTEGER,
         overall_label TEXT,
@@ -112,8 +116,9 @@ async function initDB() {
         full_result JSONB
       );
     `);
-    // Add platform column to existing tables that don't have it
     await db.query(`ALTER TABLE scans ADD COLUMN IF NOT EXISTS platform TEXT;`);
+    await db.query(`ALTER TABLE scans ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'admin';`);
+    await db.query(`ALTER TABLE scans ADD COLUMN IF NOT EXISTS device_id TEXT;`);
     console.log('Database ready. Table scans exists or was created.');
   } catch (err) {
     console.error('DB init error:', err.message);
@@ -211,14 +216,14 @@ app.post('/research-actor', async (req, res) => {
 // ─────────────────────────────────────────────
 app.post('/history/save', async (req, res) => {
   if (!db) return res.status(503).json({ error: 'Database not configured' });
-  const { id, ts, url, platform, postText, overallScore, overallLabel, topMatches, textAI, hasImage, appVersion, serverVersion, fullResult } = req.body;
+  const { id, ts, url, platform, source, deviceId, postText, overallScore, overallLabel, topMatches, textAI, hasImage, appVersion, serverVersion, fullResult } = req.body;
   if (!id || !url) return res.status(400).json({ error: 'id and url are required' });
   try {
     await db.query(
-      `INSERT INTO scans (id, ts, url, platform, post_text, overall_score, overall_label, top_matches, text_ai, has_image, app_version, server_version, comment, full_result)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, '', $13)
+      `INSERT INTO scans (id, ts, url, platform, source, device_id, post_text, overall_score, overall_label, top_matches, text_ai, has_image, app_version, server_version, comment, full_result)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, '', $15)
        ON CONFLICT (id) DO NOTHING`,
-      [id, ts || new Date().toISOString(), url, platform || null, postText || '', overallScore || 0, overallLabel || '', topMatches || [], textAI || 5, hasImage || false, appVersion || '', serverVersion || '', fullResult ? JSON.stringify(fullResult) : null]
+      [id, ts || new Date().toISOString(), url, platform || null, source || 'admin', deviceId || null, postText || '', overallScore || 0, overallLabel || '', topMatches || [], textAI || 5, hasImage || false, appVersion || '', serverVersion || '', fullResult ? JSON.stringify(fullResult) : null]
     );
     res.json({ success: true, id });
   } catch (err) {
@@ -236,7 +241,7 @@ app.post('/history/save', async (req, res) => {
 app.get('/history/list', async (req, res) => {
   if (!db) return res.status(503).json({ error: 'Database not configured' });
   try {
-    const { platform, appVersion, serverVersion, entity, dateFrom, dateTo, minScore, maxScore, minTextAI, hasComment, alignmentType } = req.query;
+    const { platform, appVersion, serverVersion, entity, dateFrom, dateTo, minScore, maxScore, minTextAI, hasComment, alignmentType, source, deviceId } = req.query;
     let where = [];
     let params = [];
     let idx = 1;
@@ -250,25 +255,36 @@ app.get('/history/list', async (req, res) => {
     if (maxScore) { where.push(`overall_score <= $${idx++}`); params.push(parseInt(maxScore)); }
     if (minTextAI) { where.push(`text_ai >= $${idx++}`); params.push(parseInt(minTextAI)); }
     if (hasComment === 'true') { where.push(`comment != ''`); }
+    if (source) { where.push(`source = $${idx++}`); params.push(source); }
+    if (deviceId) { where.push(`device_id = $${idx++}`); params.push(deviceId); }
     const whereClause = where.length ? 'WHERE ' + where.join(' AND ') : '';
     const result = await db.query(
-      `SELECT id, ts, url, platform, post_text, overall_score, overall_label, top_matches, text_ai, has_image, app_version, server_version, comment, full_result
+      `SELECT id, ts, url, platform, source, device_id, post_text, overall_score, overall_label, top_matches, text_ai, has_image, app_version, server_version, comment, full_result
        FROM scans ${whereClause} ORDER BY ts DESC LIMIT 500`,
       params
     );
+    function hashDeviceId(did) {
+      if (!did) return null;
+      let h = 0;
+      for (let i = 0; i < did.length; i++) h = (Math.imul(31, h) + did.charCodeAt(i)) | 0;
+      return 'usr_' + Math.abs(h).toString(36).slice(0,4).toUpperCase();
+    }
     const rows = result.rows.map(r => ({
       id: r.id, ts: r.ts, url: r.url, platform: r.platform,
+      source: r.source || 'admin',
+      deviceId: hashDeviceId(r.device_id),
+      rawDeviceId: r.device_id,
       postText: r.post_text, overallScore: r.overall_score,
       overallLabel: r.overall_label, topMatches: r.top_matches,
       textAI: r.text_ai, hasImage: r.has_image,
       appVersion: r.app_version, serverVersion: r.server_version,
       comment: r.comment || '', fullResult: r.full_result
     }));
-    // Client-side alignment type filter (needs full_result)
     let filtered = rows;
     if (alignmentType === 'primary') filtered = rows.filter(r => r.fullResult?.matches?.some(m => !m.secondary));
     if (alignmentType === 'secondary') filtered = rows.filter(r => r.fullResult?.matches?.some(m => m.secondary));
-    res.json({ success: true, scans: filtered });
+    const uniqueUsers = [...new Set(rows.filter(r => r.source === 'client' && r.deviceId).map(r => r.deviceId))];
+    res.json({ success: true, scans: filtered, clientUsers: uniqueUsers });
   } catch (err) {
     console.error('history/list error:', err.message);
     res.status(500).json({ error: err.message });
