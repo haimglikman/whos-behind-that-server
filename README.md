@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.11.1 — bug fix (server) | Admin: v2.2.1 | Client: v1.2.1
+- No server code changes — version bump to log client fix
+
 ### v1.11.0 (server) | Admin v2.0.0 / Client v1.0.1
 - source and device_id columns added to scans table
 - history/save accepts and stores source + deviceId
