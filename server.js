@@ -5,11 +5,11 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.11.0 — Added source ('admin'/'client') and device_id fields to scans
-//            table. history/save accepts source + deviceId. history/list
-//            supports source and deviceId filter params. device_id hashed
-//            to usr_XXXX for privacy in list responses. clientUsers array
-//            returned for admin filter dropdown.
+// v1.11.1 — No server changes. Client v1.2.1 now sends scanId (WBT string)
+//            as the primary DB key instead of numeric timestamp, fixing
+//            mismatched IDs between admin and client history views.
+//
+// v1.11.0 — Added source/device_id fields, history filters, usr_XXXX hashing.
 //
 // v1.10.4 — Facebook/Instagram redirect following, lower min text threshold.
 //
@@ -41,7 +41,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.11.0';
+const SERVER_VERSION = '1.11.1';
 
 import express from 'express';
 import cors from 'cors';
