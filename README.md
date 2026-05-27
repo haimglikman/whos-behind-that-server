@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v1.12.0 (server) | Admin: v2.3.0 | Client: v1.4.0
+- Scoring engine: context analysis added — when a post explicitly attacks a named rival, the rival's political beneficiaries are scored accordingly. Single unified score. Only applied when attack is central and rival relationship is documented.
+- Facebook fetcher: tries 3 different user agents before failing, falls back to Claude web search if all OpenGraph attempts fail
+
 ### v1.11.1 — bug fix (server) | Admin: v2.2.1 | Client: v1.2.1
 - No server code changes — version bump to log client fix
 
