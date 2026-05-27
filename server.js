@@ -5,11 +5,14 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.11.1 — No server changes. Client v1.2.1 now sends scanId (WBT string)
-//            as the primary DB key instead of numeric timestamp, fixing
-//            mismatched IDs between admin and client history views.
+// v1.12.0 — Scoring engine now considers political context (who is being
+//            attacked) alongside content. Context scoring only applied when
+//            a named target is explicitly attacked and the rival relationship
+//            is documented in the entity list. Single unified score.
+//            Facebook fetcher improved: tries 3 user agents, falls back to
+//            Claude web search if OpenGraph fails.
 //
-// v1.11.0 — Added source/device_id fields, history filters, usr_XXXX hashing.
+// v1.11.1 — No server changes. Client v1.2.1 fix for scan ID as DB key.
 //
 // v1.10.4 — Facebook/Instagram redirect following, lower min text threshold.
 //
@@ -41,7 +44,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.11.1';
+const SERVER_VERSION = '1.12.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -439,7 +442,16 @@ async function fetchFromInstagram(url) {
 // posts/pages via og:description meta tag.
 // ─────────────────────────────────────────────
 async function fetchFromFacebook(url) {
-  return await scrapeOpenGraph(url, 'facebook');
+  // Try OpenGraph first
+  try {
+    const result = await scrapeOpenGraph(url, 'facebook');
+    if (result && result.text && result.text.length >= 100) return result;
+    console.log('Facebook OpenGraph too short, trying Claude web search');
+  } catch(e) {
+    console.log('Facebook OpenGraph failed:', e.message, '— trying Claude web search');
+  }
+  // Fall back to Claude web search
+  return await fetchWithClaudeWebSearch(url, 'Facebook');
 }
 
 // ─────────────────────────────────────────────
@@ -447,26 +459,43 @@ async function fetchFromFacebook(url) {
 // Fallback for Instagram and Facebook
 // ─────────────────────────────────────────────
 async function scrapeOpenGraph(url, platform) {
-  const response = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-      'Accept': 'text/html,application/xhtml+xml',
-      'Accept-Language': 'en-US,en;q=0.9,he;q=0.8,ar;q=0.7'
-    },
-    redirect: 'follow'
-  });
-  if (!response.ok) throw new Error(`Could not access ${platform} post (HTTP ${response.status}). The post may be private or deleted.`);
-  const html = await response.text();
-  const $ = cheerio.load(html);
-  const text =
-    $('meta[property="og:description"]').attr('content') ||
-    $('meta[name="twitter:description"]').attr('content') ||
-    $('meta[property="og:title"]').attr('content') ||
-    $('meta[name="description"]').attr('content') || '';
-  if (!text) throw new Error(`Could not extract text from ${platform} post. It may require login to view.`);
-  const canonicalUrl = $('link[rel="canonical"]').attr('href') || $('meta[property="og:url"]').attr('content') || url;
-  const handleMatch = canonicalUrl.match(/(?:instagram|facebook)\.com\/([^\/\?p][^\/\?]+)/i);
-  return { text, author: null, authorHandle: handleMatch ? handleMatch[1] : null, source: 'opengraph' };
+  // Try multiple user agents — Facebook blocks Googlebot aggressively now
+  const userAgents = [
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+    'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)'
+  ];
+  let lastError;
+  for (const ua of userAgents) {
+    try {
+      const response = await fetch(url, {
+        headers: {
+          'User-Agent': ua,
+          'Accept': 'text/html,application/xhtml+xml',
+          'Accept-Language': 'en-US,en;q=0.9,he;q=0.8,ar;q=0.7',
+          'Cache-Control': 'no-cache'
+        },
+        redirect: 'follow'
+      });
+      if (!response.ok) {
+        lastError = new Error(`HTTP ${response.status}`);
+        continue;
+      }
+      const html = await response.text();
+      const $ = cheerio.load(html);
+      const text =
+        $('meta[property="og:description"]').attr('content') ||
+        $('meta[name="twitter:description"]').attr('content') ||
+        $('meta[property="og:title"]').attr('content') ||
+        $('meta[name="description"]').attr('content') || '';
+      if (!text) { lastError = new Error('No text in meta tags'); continue; }
+      const canonicalUrl = $('link[rel="canonical"]').attr('href') || $('meta[property="og:url"]').attr('content') || url;
+      const handleMatch = canonicalUrl.match(/(?:instagram|facebook)\.com\/([^\/\?p][^\/\?]+)/i);
+      console.log(`${platform} OpenGraph success with UA: ${ua.slice(0,40)}... text length: ${text.length}`);
+      return { text, author: null, authorHandle: handleMatch ? handleMatch[1] : null, source: 'opengraph' };
+    } catch(e) { lastError = e; }
+  }
+  throw new Error(`Could not extract text from ${platform} post — ${lastError?.message || 'unknown error'}. It may require login to view.`);
 }
 
 // ─────────────────────────────────────────────
@@ -763,7 +792,17 @@ For EACH entity above, assess three dimensions:
 
 1. interest_score (0-100) — MOST IMPORTANT (weight: 55%)
    "Would spreading this post advance this entity's HIDDEN strategic interest?"
-   Score independently of whether the entity publicly claims to support the cause.
+   Consider TWO angles — apply whichever is stronger, or combine if both are present:
+   a) CONTENT: Does the post's message, framing, or narrative directly serve this entity's interests?
+   b) CONTEXT: Does the post attack, undermine, or discredit someone this entity considers a rival or opponent?
+      ONLY apply context scoring if ALL three conditions are met:
+      - A specific named or unmistakably identifiable target is being attacked
+      - That attack is CENTRAL to the post (not incidental or passing)
+      - The rival relationship between that target and this entity is documented in the entity list above
+      If context scoring applies, weight it according to how explicit and central the attack is:
+      - Very direct, central attack on a named rival → strong context signal, weight heavily
+      - Implied or between-the-lines criticism → weaker signal, weight moderately
+      If context is the primary driver of the score, explain this clearly in the "why" field.
 
 2. mo_score (0-100) — IMPORTANT (weight: 35%)
    "Does the construction of this post match this entity's known manipulation playbook?"
