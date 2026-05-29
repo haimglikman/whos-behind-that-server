@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v1.12.2 — bug fix (server) | Admin: v2.3.1 | Client: v1.5.1
+- X oEmbed fetcher now reconstructs proper username URL using author_url from oEmbed response
+- Normalized URL returned in API response so both frontends store the correct URL
+
 ### v1.12.1 (server) | Admin: v2.3.0 | Client: v1.5.0
 - Beneficiary chain rule: when a post attacks Entity A, A's documented rivals now score high even if never mentioned in the post — fixes zero-alignment on posts that only attack rivals
 - Preference/ranking list rule: "X over 1000 Y" correctly scores X high, not just Y low
