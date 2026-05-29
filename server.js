@@ -5,14 +5,15 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.12.0 — Scoring engine now considers political context (who is being
-//            attacked) alongside content. Context scoring only applied when
-//            a named target is explicitly attacked and the rival relationship
-//            is documented in the entity list. Single unified score.
-//            Facebook fetcher improved: tries 3 user agents, falls back to
-//            Claude web search if OpenGraph fails.
+// v1.12.1 — Scoring prompt: added three new critical rules:
+//            (1) Beneficiary chain — when A is attacked, A's rival scores
+//            high even if never mentioned. Fixes zero-alignment on posts
+//            that only attack rivals without naming the beneficiary.
+//            (2) Preference/ranking lists — "X over 1000 Y" scores X high.
+//            (3) Sarcasm detection — assume literal intent unless explicit
+//            irony markers are present. Don't second-guess genuine posts.
 //
-// v1.11.1 — No server changes. Client v1.2.1 fix for scan ID as DB key.
+// v1.12.0 — Context scoring + Facebook UA improvements.
 //
 // v1.10.4 — Facebook/Instagram redirect following, lower min text threshold.
 //
@@ -44,7 +45,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.12.0';
+const SERVER_VERSION = '1.12.1';
 
 import express from 'express';
 import cors from 'cors';
@@ -823,6 +824,26 @@ After scoring, classify each match (combined_score >= 60) as either:
 
 CRITICAL RULE — CRITICISM IS NOT ALIGNMENT:
 If a post ATTACKS, CRITICIZES, or DELEGITIMIZES an entity, that entity scores LOW on primary alignment — being criticized does not serve your interest. A post mocking Netanyahu does NOT align with Netanyahu. A post exposing Hamas atrocities does NOT align with Hamas. Only score an entity high if spreading the post HELPS them.
+
+CRITICAL RULE — COMPLETE THE BENEFICIARY CHAIN:
+When a post attacks Entity A, always ask: who benefits from Entity A being weakened or discredited? If Entity A's rival (Entity B) is documented in the entity list, Entity B scores HIGH — even if Entity B is never mentioned in the post. This is the most commonly missed signal.
+Examples:
+- Post attacks Bennett, Lapid, Golan → Netanyahu scores high (his rivals are being delegitimized)
+- Post attacks Netanyahu → Israeli opposition scores high
+- Post attacks PA/Abbas → Hamas scores high
+- Post attacks Hamas → PA/Abbas and Israel score high
+Apply this chain for EVERY named target in the post. Never stop at "target scores low" — always follow through to "therefore rival scores high."
+
+CRITICAL RULE — PREFERENCE LISTS AND RANKINGS:
+When a post ranks or compares entities ("I prefer X over Y", "X is 1000 times better than Y"), the entity being elevated scores HIGH, the entity being dismissed scores LOW. A post saying "Netanyahu 1 over 1,000,000,000 Bennett/Lapid/Golan" strongly serves Netanyahu's interest and attacks his rivals — do not be confused by the list format. Score the beneficiary of the glorification, not just the targets of criticism.
+
+CRITICAL RULE — SARCASM AND IRONY DETECTION:
+Assume literal intent UNLESS the post contains explicit irony markers:
+- Quotation marks around praise that reads as mockery
+- A punchline or final line that contradicts the surface meaning
+- Exaggerated praise that is internally inconsistent ("the greatest leader in all of history" style)
+- Hebrew irony markers: "כן בטח", "בטח שכן", "ברור", used sarcastically
+If none of these are present, score the post at face value. Do NOT second-guess straightforward political preference posts. The risk of misidentifying genuine support as sarcasm is greater than missing actual sarcasm.
 
 CRITICAL RULE — INTRA-COALITION CRITICISM:
 Entities in the same political coalition can still have distinct and sometimes conflicting interests. A post criticizing Netanyahu from the RIGHT (e.g. settlers or Ben Gvir demanding harder enforcement) does NOT align with Netanyahu — it aligns with the settler/nationalist bloc specifically. A post criticizing Netanyahu from the LEFT aligns with the Israeli opposition, not with Iran or Hamas even if they also oppose Netanyahu. Score each entity's specific interest independently, not by coalition membership alone.
