@@ -5,7 +5,12 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.12.1 — Scoring prompt: added three new critical rules:
+// v1.12.3 — Translation prompt improved: now explicitly extracts who is
+//            being praised vs attacked, and flags ranking/preference lists
+//            with political interpretation. Fixes zero-alignment on Hebrew
+//            list posts where generic context summary lost the signal.
+//
+// v1.12.2 — X URL normalization fix.
 //            (1) Beneficiary chain — when A is attacked, A's rival scores
 //            high even if never mentioned. Fixes zero-alignment on posts
 //            that only attack rivals without naming the beneficiary.
@@ -45,7 +50,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.12.1';
+const SERVER_VERSION = '1.12.3';
 
 import express from 'express';
 import cors from 'cors';
@@ -192,7 +197,8 @@ app.post('/fetch-and-analyze', async (req, res) => {
     if (!postData.text) return res.status(422).json({ error: 'Could not extract post text. The post may be private or the platform may be blocking access.' });
     if (postData.text.length < 100) return res.status(422).json({ error: `Fetched text is too short (${postData.text.length} chars) — the platform may have returned only a title or preview. Please paste the full post text manually.` });
     const analysis = await scoreWithClaude(postData.text, entities);
-    res.json({ success: true, platform, post: postData, analysis });
+    const responseUrl = postData.normalizedUrl || url;
+    res.json({ success: true, platform, post: postData, analysis, url: responseUrl });
   } catch (err) {
     console.error('fetch-and-analyze error:', err.message);
     res.status(500).json({ error: err.message });
@@ -418,12 +424,19 @@ async function fetchFromX(url) {
   const $ = cheerio.load(data.html || '');
   $('a').last().remove();
   const rawText = $('p').first().text().trim();
+  const authorHandle = data.author_url ? data.author_url.split('/').pop() : null;
+  // Reconstruct proper username URL if we got an /i/status/ format
+  const statusId = url.match(/status\/(\d+)/)?.[1];
+  const normalizedUrl = (authorHandle && statusId)
+    ? `https://x.com/${authorHandle}/status/${statusId}`
+    : url;
   return {
     text: rawText,
     author: data.author_name || null,
-    authorHandle: data.author_url ? data.author_url.split('/').pop() : null,
+    authorHandle,
     html: data.html,
-    source: 'oembed'
+    source: 'oembed',
+    normalizedUrl
   };
 }
 
@@ -626,7 +639,12 @@ function isNonEnglish(text) {
 async function translatePost(postText) {
   const prompt = `The following social media post is written in Hebrew or Arabic. Provide:
 1. A full English translation
-2. A one-paragraph political context summary identifying: what is being argued, who is being addressed, what action is being demanded, and what political camp this language belongs to.
+2. A political context analysis identifying:
+   - What is the main argument or message?
+   - Which political figures or entities are being PRAISED, ELEVATED, or DEFENDED?
+   - Which political figures or entities are being ATTACKED, CRITICIZED, or DISMISSED?
+   - What political camp does this language belong to?
+   - If this is a ranking or preference list ("X over Y"), explicitly state who is ranked higher and what that implies politically.
 
 POST TEXT:
 "${postText}"
@@ -640,7 +658,7 @@ Respond ONLY with valid JSON:
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 600, temperature: 0, messages: [{ role: 'user', content: prompt }] })
+    body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 800, temperature: 0, messages: [{ role: 'user', content: prompt }] })
   });
   if (!response.ok) return null;
   const data = await response.json();
