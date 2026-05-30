@@ -5,12 +5,9 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.12.3 — Translation prompt improved: now explicitly extracts who is
-//            being praised vs attacked, and flags ranking/preference lists
-//            with political interpretation. Fixes zero-alignment on Hebrew
-//            list posts where generic context summary lost the signal.
+// v1.12.4 — Added whosbehindthat.com to CORS allowed origins.
 //
-// v1.12.2 — X URL normalization fix.
+// v1.12.3 — Translation prompt improved.
 //            (1) Beneficiary chain — when A is attacked, A's rival scores
 //            high even if never mentioned. Fixes zero-alignment on posts
 //            that only attack rivals without naming the beneficiary.
@@ -50,7 +47,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.12.3';
+const SERVER_VERSION = '1.12.4';
 
 import express from 'express';
 import cors from 'cors';
@@ -87,6 +84,7 @@ if (process.env.DATABASE_URL) {
 // ── CORS
 const ALLOWED_ORIGINS = [
   /^https:\/\/.*\.github\.io$/,
+  /^https:\/\/(.*\.)?whosbehindthat\.com$/,
   /^http:\/\/localhost(:\d+)?$/,
   /^http:\/\/127\.0\.0\.1(:\d+)?$/,
 ];
