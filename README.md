@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.12.4 — bug fix (server) | Admin: v2.3.1 | Client: v1.5.1
+- Added whosbehindthat.com and admin.whosbehindthat.com to CORS allowed origins
+
 ### v1.12.3 — bug fix (server) | Admin: v2.3.1 | Client: v1.5.1
 - Translation prompt now explicitly extracts who is praised vs attacked, and interprets ranking/preference lists politically
 - Fixes zero-alignment on Hebrew list posts (e.g. "Netanyahu 1 over 1,000,000,000 Bennett/Lapid/Golan")
