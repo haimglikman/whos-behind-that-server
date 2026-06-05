@@ -5,6 +5,15 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.13.0 — News website support: detects 60+ news domains, fetches article
+//            text via OpenGraph + article body scraping. Hybrid publication
+//            research: static DB for 35+ major outlets, Claude web search
+//            for unknown outlets. Actor research updated to include
+//            publication profile for news URLs. Actors table in PostgreSQL:
+//            saves all actor searches with source, deviceId, actor/publication
+//            data. New GET /actors/list endpoint for admin history.
+//            Actor research now uses web_search tool for better results.
+//
 // v1.12.4 — Added whosbehindthat.com to CORS allowed origins.
 //
 // v1.12.3 — Translation prompt improved.
@@ -47,7 +56,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.12.4';
+const SERVER_VERSION = '1.13.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -124,8 +133,20 @@ async function initDB() {
       );
     `);
     await db.query(`ALTER TABLE scans ADD COLUMN IF NOT EXISTS platform TEXT;`);
-    await db.query(`ALTER TABLE scans ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'admin';`);
-    await db.query(`ALTER TABLE scans ADD COLUMN IF NOT EXISTS device_id TEXT;`);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS actors (
+        id TEXT PRIMARY KEY,
+        ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        handle TEXT NOT NULL,
+        source TEXT DEFAULT 'admin',
+        device_id TEXT,
+        app_version TEXT,
+        server_version TEXT,
+        actor_data JSONB,
+        publication_data JSONB,
+        url TEXT
+      );
+    `);
     console.log('Database ready. Table scans exists or was created.');
   } catch (err) {
     console.error('DB init error:', err.message);
@@ -148,11 +169,12 @@ app.post('/fetch-post', async (req, res) => {
   if (!url) return res.status(400).json({ error: 'url is required' });
   try {
     const platform = detectPlatform(url);
-    if (!platform) return res.status(400).json({ error: 'Unsupported platform. Use X, Facebook, or Instagram URLs.' });
+    if (!platform) return res.status(400).json({ error: 'Unsupported URL. Paste a URL from X, Facebook, Instagram, or a supported news website.' });
     let result;
     if (platform === 'x') result = await fetchFromX(url);
     else if (platform === 'facebook') result = await fetchFromFacebook(url);
     else if (platform === 'instagram') result = await fetchFromInstagram(url);
+    else if (platform === 'news') result = await fetchFromNews(url);
     res.json({ success: true, platform, ...result });
   } catch (err) {
     console.error('fetch-post error:', err.message);
@@ -187,13 +209,15 @@ app.post('/fetch-and-analyze', async (req, res) => {
   if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
   try {
     const platform = detectPlatform(url);
-    if (!platform) return res.status(400).json({ error: 'Unsupported platform. Use X, Facebook, or Instagram URLs.' });
+    if (!platform) return res.status(400).json({ error: 'Unsupported URL. Paste a URL from X, Facebook, Instagram, or a supported news website.' });
     let postData;
     if (platform === 'x') postData = await fetchFromX(url);
     else if (platform === 'facebook') postData = await fetchFromFacebook(url);
     else if (platform === 'instagram') postData = await fetchFromInstagram(url);
-    if (!postData.text) return res.status(422).json({ error: 'Could not extract post text. The post may be private or the platform may be blocking access.' });
-    if (postData.text.length < 100) return res.status(422).json({ error: `Fetched text is too short (${postData.text.length} chars) — the platform may have returned only a title or preview. Please paste the full post text manually.` });
+    else if (platform === 'news') postData = await fetchFromNews(url);
+    if (!postData.text) return res.status(422).json({ error: 'Could not extract text. The content may be private, paywalled, or the platform may be blocking access.' });
+    const minLen = platform === 'news' ? 50 : 100;
+    if (postData.text.length < minLen) return res.status(422).json({ error: `Fetched text is too short (${postData.text.length} chars). Please paste the article text manually.` });
     const analysis = await scoreWithClaude(postData.text, entities);
     const responseUrl = postData.normalizedUrl || url;
     res.json({ success: true, platform, post: postData, analysis, url: responseUrl });
@@ -207,15 +231,60 @@ app.post('/fetch-and-analyze', async (req, res) => {
 // POST /research-actor
 // ─────────────────────────────────────────────
 app.post('/research-actor', async (req, res) => {
-  const { handle, url } = req.body;
+  const { handle, url, source, deviceId, appVersion, actorScanId } = req.body;
   if (!handle) return res.status(400).json({ error: 'handle is required' });
   if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
   try {
-    const actor = await researchActorWithClaude(handle, url);
-    res.json({ success: true, actor });
+    const isNews = url && isNewsDomain(url);
+    const domain = isNews ? extractDomain(url) : null;
+    // Run author and publication research in parallel if news
+    const [actor, publication] = await Promise.all([
+      researchActorWithClaude(handle, url, isNews),
+      isNews ? researchPublicationWithClaude(domain) : Promise.resolve(null)
+    ]);
+    // Save to DB
+    if (db && actorScanId) {
+      await db.query(
+        `INSERT INTO actors (id, ts, handle, source, device_id, app_version, server_version, actor_data, publication_data, url)
+         VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (id) DO NOTHING`,
+        [actorScanId, handle, source || 'admin', deviceId || null, appVersion || '', SERVER_VERSION,
+         JSON.stringify(actor), publication ? JSON.stringify(publication) : null, url || null]
+      ).catch(e => console.warn('Actor DB save failed:', e.message));
+    }
+    res.json({ success: true, actor, publication, isNews });
   } catch (err) {
     console.error('research-actor error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /actors/list
+// ─────────────────────────────────────────────
+app.get('/actors/list', async (req, res) => {
+  if (!db) return res.json({ success: true, actors: [] });
+  try {
+    const result = await db.query(
+      `SELECT id, ts, handle, source, device_id, app_version, server_version, actor_data, publication_data, url
+       FROM actors ORDER BY ts DESC LIMIT 500`
+    );
+    function hashDeviceId(did) {
+      if (!did) return null;
+      let h = 0;
+      for (let i = 0; i < did.length; i++) h = (Math.imul(31, h) + did.charCodeAt(i)) | 0;
+      return 'usr_' + Math.abs(h).toString(36).slice(0,4).toUpperCase();
+    }
+    const actors = result.rows.map(r => ({
+      id: r.id, ts: r.ts, handle: r.handle,
+      source: r.source || 'admin',
+      deviceId: hashDeviceId(r.device_id),
+      appVersion: r.app_version, serverVersion: r.server_version,
+      actorData: r.actor_data, publicationData: r.publication_data,
+      url: r.url
+    }));
+    res.json({ success: true, actors });
+  } catch(e) {
+    console.error('actors/list error:', e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -408,7 +477,52 @@ function detectPlatform(url) {
   if (/x\.com|twitter\.com/i.test(url)) return 'x';
   if (/facebook\.com|fb\.com/i.test(url)) return 'facebook';
   if (/instagram\.com/i.test(url)) return 'instagram';
+  if (isNewsDomain(url)) return 'news';
   return null;
+}
+
+async function fetchFromNews(url) {
+  const domain = extractDomain(url);
+  const userAgents = [
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Googlebot/2.1 (+http://www.google.com/bot.html)',
+    'Mozilla/5.0 (compatible; Bingbot/2.0; +http://www.bing.com/bingbot.htm)'
+  ];
+  let lastError;
+  for (const ua of userAgents) {
+    try {
+      const response = await fetch(url, {
+        headers: { 'User-Agent': ua, 'Accept': 'text/html,application/xhtml+xml', 'Accept-Language': 'en-US,en;q=0.9,he;q=0.8' },
+        redirect: 'follow'
+      });
+      if (!response.ok) { lastError = new Error(`HTTP ${response.status}`); continue; }
+      const html = await response.text();
+      const $ = cheerio.load(html);
+      // Try to get article body first, fall back to meta tags
+      const articleSelectors = ['article p', '.article-body p', '.story-body p', '[itemprop="articleBody"] p', '.content-area p'];
+      let text = '';
+      for (const sel of articleSelectors) {
+        const paragraphs = $(sel).map((i, el) => $(el).text().trim()).get().filter(t => t.length > 50);
+        if (paragraphs.length > 0) { text = paragraphs.slice(0, 10).join(' '); break; }
+      }
+      // Fall back to meta tags if no article body found
+      if (!text || text.length < 100) {
+        text = $('meta[property="og:description"]').attr('content') ||
+               $('meta[name="description"]').attr('content') ||
+               $('meta[property="og:title"]').attr('content') || '';
+      }
+      const title = $('meta[property="og:title"]').attr('content') || $('title').text() || '';
+      // Get author if available
+      const author = $('meta[name="author"]').attr('content') ||
+                     $('[rel="author"]').first().text() ||
+                     $('[itemprop="author"]').first().text() || null;
+      if (!text || text.length < 50) { lastError = new Error('Could not extract article text'); continue; }
+      const fullText = title ? `${title}\n\n${text}` : text;
+      console.log(`News fetch success from ${domain}, text length: ${fullText.length}`);
+      return { text: fullText, author: author ? author.trim() : null, authorHandle: author ? author.trim() : null, source: 'news', domain };
+    } catch(e) { lastError = e; }
+  }
+  throw new Error(`Could not fetch article from ${domain}. ${lastError?.message || ''}. The article may be paywalled or require login.`);
 }
 
 // ─────────────────────────────────────────────
@@ -912,36 +1026,176 @@ Respond ONLY with valid JSON, no preamble, no markdown:
 // ─────────────────────────────────────────────
 // ACTOR RESEARCH
 // ─────────────────────────────────────────────
-async function researchActorWithClaude(handle, url) {
-  const prompt = `You are an open-source intelligence (OSINT) researcher. Research the following social media account and provide a factual profile based on publicly available information.
+// ─────────────────────────────────────────────
+// NEWS DOMAIN DETECTION
+// ─────────────────────────────────────────────
+const NEWS_DOMAINS = new Set([
+  // Israeli outlets
+  'ynet.co.il','ynetnews.com','haaretz.co.il','haaretz.com','israelhayom.co.il','israelhayom.com',
+  'inn.co.il','arutzsheva.co.il','arutz7.co.il','mako.co.il','n12.co.il','kan.org.il',
+  'walla.co.il','maariv.co.il','timesofisrael.com','jpost.com','jerusalempost.com',
+  '972mag.com','plus972.com','calcalist.co.il','globes.co.il','themarker.com',
+  'zman.co.il','ice.co.il','sport5.co.il','reshet.tv','channel14.co.il','galatz.co.il',
+  // International
+  'bbc.com','bbc.co.uk','reuters.com','apnews.com','nytimes.com','washingtonpost.com',
+  'theguardian.com','aljazeera.com','aljazeera.net','cnn.com','foxnews.com','nbcnews.com',
+  'abcnews.go.com','cbsnews.com','msnbc.com','politico.com','thehill.com','axios.com',
+  'bloomberg.com','economist.com','ft.com','wsj.com','newsweek.com','time.com',
+  'foreignpolicy.com','foreignaffairs.com','atlanticcouncil.org','brookings.edu',
+  'le-monde.fr','lemonde.fr','lefigaro.fr','derspiegel.de','spiegel.de','sueddeutsche.de',
+  'independent.co.uk','telegraph.co.uk','thetimes.co.uk','dailymail.co.uk','mirror.co.uk',
+  'middleeasteye.net','arabicpost.net','asharqalawsat.com','alarabiya.net','almonitor.com',
+  'i24news.tv','jewishinsider.com','tabletmag.com','mosaic.org','commentary.org',
+  'debka.com','debkafile.com','memri.org','jihadwatch.org',
+  'axios.com','vox.com','vice.com','buzzfeednews.com','huffpost.com',
+]);
 
-Account handle: @${handle}
-${url ? `Profile URL context: ${url}` : ''}
+function isNewsDomain(url) {
+  try {
+    const domain = new URL(url).hostname.replace(/^www\./, '');
+    return NEWS_DOMAINS.has(domain);
+  } catch(e) { return false; }
+}
 
-Provide the following:
-1. name: The real name of the person or organization behind this account (if publicly known). If unknown, use the handle.
-2. bio: A factual 2-paragraph summary of who this actor is — their background, what they are known for, their political or ideological stance, and any notable activities or affiliations. If this is an anonymous or low-profile account with no public information, state that clearly and briefly.
-3. location: The country or city they are known to be based in (if publicly known). Write "Unknown" if not established.
-4. handles: An array of known social media handles, websites, or other online presence associated with this actor. Include platform prefix e.g. "X: @handle", "Instagram: @handle", "Website: domain.com". Include only verified or highly likely matches.
+function extractDomain(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch(e) { return url; }
+}
 
-Be factual and neutral. Do not speculate beyond what is publicly known. If this is a clearly anonymous account or a bot farm with no traceable identity, say so explicitly in the bio.
+// ─────────────────────────────────────────────
+// STATIC PUBLICATION DATABASE
+// ─────────────────────────────────────────────
+const PUBLICATION_DB = {
+  // ── ISRAELI ──
+  'ynet.co.il': { name:'Ynet / Yedioth Ahronoth', type:'News website', country:'Israel', language:'Hebrew', founded:'1999 (Ynet); 1939 (Yedioth)', ownership:'Yedioth Communications (Arnon Mozes)', agenda:'Israel\'s most-read news site. Centrist-populist orientation, historically close to the Yedioth Ahronoth print newspaper which had a famously adversarial relationship with Netanyahu. Broadly mainstream, covers the full political spectrum but editorially leans center. High-traffic, tabloid-influenced style alongside serious news coverage.' },
+  'ynetnews.com': { name:'Ynetnews (Ynet English)', type:'News website', country:'Israel', language:'English', founded:'1999', ownership:'Yedioth Communications', agenda:'English-language version of Ynet. Same editorial orientation — centrist Israeli mainstream. Primary destination for international readers seeking Israeli news from an Israeli source.' },
+  'haaretz.co.il': { name:'Haaretz', type:'Newspaper', country:'Israel', language:'Hebrew', founded:'1919', ownership:'Schocken family; M. DuMont Schauberg (minority stake)', agenda:'Israel\'s oldest daily and its most internationally recognized left-liberal publication. Strongly advocates for two-state solution, rule of law, judicial independence, and civil liberties. Critical of settlement expansion, Netanyahu governments, and military excesses. Readership skews secular, Ashkenazi, educated, and politically left. Frequently targeted by the Israeli right as unpatriotic. Strong investigative journalism tradition.' },
+  'haaretz.com': { name:'Haaretz English', type:'Newspaper', country:'Israel', language:'English', founded:'1919', ownership:'Schocken family', agenda:'English-language edition of Haaretz. Same editorial line — left-liberal Israeli perspective. Widely read internationally by diaspora Jews, foreign policy analysts, and journalists covering the conflict.' },
+  'israelhayom.co.il': { name:'Israel Hayom', type:'Newspaper', country:'Israel', language:'Hebrew', founded:'2007', ownership:'Miriam Adelson (Sheldon Adelson estate)', agenda:'Free daily newspaper founded with explicit support for Benjamin Netanyahu. Editorially pro-Likud and pro-Netanyahu. Israel\'s most widely distributed print newspaper by circulation (free distribution model). Critics call it "Bibiton" (Netanyahu\'s paper). Strong on security narratives, right-wing framing of the conflict, and supportive coverage of settlement policy.' },
+  'israelhayom.com': { name:'Israel Hayom English', type:'Newspaper', country:'Israel', language:'English', founded:'2007', ownership:'Miriam Adelson', agenda:'English version of Israel Hayom. Same pro-Netanyahu, right-wing orientation. Distributed internationally to support pro-Israel and pro-Likud narratives.' },
+  'inn.co.il': { name:'Arutz Sheva / Israel National News', type:'News website', country:'Israel', language:'Hebrew/English', founded:'1988 (radio); 1995 (web)', ownership:'Non-profit associated with the settler movement', agenda:'Voice of the religious-Zionist settler movement. Strongly pro-settlement, pro-annexation, and ideologically aligned with Religious Zionism and Otzma Yehudit. Opposed to any territorial compromise, Palestinian state, or land withdrawals. Readership: religious-Zionist, settler community, and right-wing diaspora.' },
+  'arutzsheva.co.il': { name:'Arutz Sheva', type:'News website', country:'Israel', language:'Hebrew', founded:'1988', ownership:'Settler movement non-profit', agenda:'Religious-Zionist and settler-oriented news. See inn.co.il.' },
+  'mako.co.il': { name:'Mako / Channel 12', type:'TV & news website', country:'Israel', language:'Hebrew', founded:'2001', ownership:'Keshet Broadcasting', agenda:'Israel\'s most-watched commercial TV channel and associated news website. Centrist, ratings-driven. Known for hard-hitting news programs including "Uvda" (investigative) and "Meet the Press"-style political coverage. Has broadcast major investigative pieces critical of Netanyahu. Broadly mainstream.' },
+  'n12.co.il': { name:'N12 / Channel 12 News', type:'TV news website', country:'Israel', language:'Hebrew', founded:'1993', ownership:'Keshet Broadcasting', agenda:'News arm of Channel 12. Centrist mainstream Israeli TV news. Known for serious political journalism.' },
+  'kan.org.il': { name:'Kan / Israeli Public Broadcasting Corporation', type:'Public broadcaster', country:'Israel', language:'Hebrew', founded:'2017 (replacing IBA)', ownership:'Israeli government public corporation', agenda:'Israel\'s public broadcaster. Legally required to maintain editorial balance. Generally perceived as centrist-liberal, with strong news and cultural programming. The government has periodically threatened its funding. Respected for journalistic standards.' },
+  'walla.co.il': { name:'Walla News', type:'News portal', country:'Israel', language:'Hebrew', founded:'1995', ownership:'Bezeq (telecom)', agenda:'Major Israeli news portal and ISP. Centrist commercial news, somewhat tabloid-influenced. Less politically distinctive than Haaretz or Israel Hayom.' },
+  'maariv.co.il': { name:'Maariv', type:'Newspaper', country:'Israel', language:'Hebrew', founded:'1948', ownership:'NMC (various)', agenda:'Historic Israeli daily, now primarily online. Center-right orientation, formerly one of Israel\'s most important papers. Reduced influence in recent decades.' },
+  'timesofisrael.com': { name:'The Times of Israel', type:'News website', country:'Israel', language:'English', founded:'2012', ownership:'David Horovitz (founder/editor); various investors', agenda:'English-language Israeli news site. Center-right editorially, generally supportive of Israel\'s security establishment but critical of extremism. Widely read by diaspora Jews, foreign diplomats, and international journalists. Gives significant voice to settler and right-wing perspectives alongside mainstream coverage.' },
+  'jpost.com': { name:'The Jerusalem Post', type:'Newspaper', country:'Israel', language:'English', founded:'1932', ownership:'Miriam Adelson (majority)', agenda:'Israel\'s flagship English-language newspaper. Historically centrist but shifted right after acquisition by the Adelson family. Strong on security narratives, US-Israel relations, and pro-Israel advocacy internationally. Has a conservative-leaning op-ed section and is widely read by American Jewish conservatives and Republican politicians.' },
+  '972mag.com': { name:'+972 Magazine', type:'Online magazine', country:'Israel/Palestine', language:'English', founded:'2010', ownership:'Non-profit cooperative', agenda:'Explicitly progressive, anti-occupation publication covering Israel-Palestine from a left-wing and Palestinian rights perspective. Run by Israeli and Palestinian journalists. Strongly advocates for Palestinian rights, documents military abuses and settler violence, and supports BDS-adjacent positions. Frequently cited by international human rights organizations and sharply criticized by Israeli government and right-wing groups.' },
+  'calcalist.co.il': { name:'Calcalist', type:'Business newspaper', country:'Israel', language:'Hebrew', founded:'2008', ownership:'Yedioth Communications', agenda:'Israel\'s leading business and economics daily. Focuses on tech sector, startups, and economic policy. Generally non-partisan on security issues but has strong coverage of economic impacts of the war.' },
+  'globes.co.il': { name:'Globes', type:'Business newspaper', country:'Israel', language:'Hebrew', founded:'1983', ownership:'Shimon Laor', agenda:'Israel\'s oldest business daily. Financial and economic focus, centrist. Has been a voice for the Israeli business community\'s concerns about the war\'s economic impact.' },
+  'themarker.com': { name:'TheMarker', type:'Business newspaper', country:'Israel', language:'Hebrew', founded:'2001', ownership:'Haaretz Group', agenda:'Business supplement and website affiliated with Haaretz. Left-leaning on economic and social issues, critical of monopolies and inequality. Shares Haaretz\'s broadly liberal editorial stance.' },
+  'channel14.co.il': { name:'Channel 14 / NOW 14', type:'TV channel', country:'Israel', language:'Hebrew', founded:'2020', ownership:'Right-wing media consortium', agenda:'Explicitly right-wing pro-Netanyahu channel. Often called "Bibi TV" by critics. Strong supporter of Netanyahu, Ben Gvir, and Smotrich. Attacks judicial independence, mainstream media, and the left. Significant influence within the Israeli right-wing base.' },
+  // ── INTERNATIONAL ──
+  'bbc.com': { name:'BBC', type:'Public broadcaster', country:'UK', language:'English', founded:'1922', ownership:'UK public charter', agenda:'British public broadcaster. Legally required to be impartial. Generally perceived as center-left by conservatives, center-right by progressives. Has faced sustained criticism from both pro-Israel and pro-Palestinian groups for its coverage. Strong international reporting, emphasis on humanitarian angles.' },
+  'bbc.co.uk': { name:'BBC', type:'Public broadcaster', country:'UK', language:'English', founded:'1922', ownership:'UK public charter', agenda:'See bbc.com.' },
+  'reuters.com': { name:'Reuters', type:'Wire service', country:'UK/Global', language:'English', founded:'1851', ownership:'Thomson Reuters', agenda:'Global wire service. Emphasizes factual, neutral reporting. No clear editorial line. Widely used as a primary source by other publications. Has been criticized by both sides of the conflict for specific word choices (e.g. reluctance to use "terrorist"). Generally the gold standard for factual reporting.' },
+  'apnews.com': { name:'Associated Press (AP)', type:'Wire service', country:'USA', language:'English', founded:'1846', ownership:'Non-profit cooperative', agenda:'American wire service. Similar to Reuters — factual, neutral, wire-focused. Widely distributed, sets the baseline for much international coverage. Has been criticized for specific Gaza coverage decisions.' },
+  'nytimes.com': { name:'The New York Times', type:'Newspaper', country:'USA', language:'English', founded:'1851', ownership:'New York Times Company (Sulzberger family)', agenda:'America\'s newspaper of record. Center-left editorially, with strong international coverage. Has published extensive Gaza civilian casualty reporting and has been criticized by both pro-Israel groups (for alleged bias against Israel) and progressive groups (for alleged softness on Israel). Internal tensions between editorial stance and opinion sections are notable. Influential globally.' },
+  'washingtonpost.com': { name:'The Washington Post', type:'Newspaper', country:'USA', language:'English', founded:'1877', ownership:'Jeff Bezos', agenda:'Major US daily. Center-left editorial stance, strong on US politics and foreign policy. Has been critical of Netanyahu\'s government and supportive of a two-state solution while maintaining pro-Israel security baseline. Bezos ownership has not dramatically altered editorial line.' },
+  'theguardian.com': { name:'The Guardian', type:'Newspaper', country:'UK', language:'English', founded:'1821', ownership:'Scott Trust (non-profit)', agenda:'British left-liberal newspaper. Strong supporter of Palestinian rights, two-state solution, and international humanitarian law. Among the most critical mainstream publications of Israeli military conduct. Publishes extensively on Gaza civilian casualties, settler violence, and occupation. Significant influence in European progressive circles.' },
+  'aljazeera.com': { name:'Al Jazeera', type:'TV & news website', country:'Qatar', language:'English/Arabic', founded:'1996', ownership:'Qatari government (Al Jazeera Media Network)', agenda:'Qatari state-funded international broadcaster. Editorially gives significant voice to Palestinian perspectives, Hamas political figures, and Muslim Brotherhood-aligned viewpoints. Critical of Israel, Egypt, Saudi Arabia, and UAE. Banned in Israel since 2024. Strong reporting on Gaza but widely seen as having a clear editorial sympathy toward Palestinian resistance narratives. Flagship of Qatari soft power.' },
+  'aljazeera.net': { name:'Al Jazeera Arabic', type:'TV & news website', country:'Qatar', language:'Arabic', founded:'1996', ownership:'Qatari government', agenda:'Arabic-language Al Jazeera. Similar editorial orientation to English edition but more overtly political in Arabic-language discourse. Highly influential across the Arab world.' },
+  'cnn.com': { name:'CNN', type:'TV & news website', country:'USA', language:'English', founded:'1980', ownership:'Warner Bros. Discovery', agenda:'Major US cable news network. Center to center-left. Has extensive Gaza coverage with emphasis on civilian humanitarian crisis. Criticized by pro-Israel groups for civilian casualty focus and by progressives for alleged insufficient criticism of Israeli policy. Large international audience.' },
+  'foxnews.com': { name:'Fox News', type:'TV & news website', country:'USA', language:'English', founded:'1996', ownership:'Fox Corporation (Rupert Murdoch)', agenda:'Dominant US right-wing cable news network. Strongly pro-Israel and pro-Netanyahu, frames Hamas as purely terrorist with no political dimension, supports strong US military support for Israel, and is critical of any pressure on Israel. Major influence on Republican political discourse on Israel.' },
+  'wsj.com': { name:'The Wall Street Journal', type:'Newspaper', country:'USA', language:'English', founded:'1889', ownership:'News Corp (Rupert Murdoch)', agenda:'Leading US financial and business newspaper. Center-right news coverage, conservative opinion section. Generally pro-Israel security stance, critical of Iran, and skeptical of Palestinian Authority governance. Strong on economic and financial dimensions of the conflict.' },
+  'ft.com': { name:'Financial Times', type:'Newspaper', country:'UK', language:'English', founded:'1888', ownership:'Nikkei Inc (Japanese)', agenda:'Global financial newspaper. Center-right economically, centrist on geopolitics. Strong on economic analysis of the conflict — arms sales, sanctions, investment. Generally balanced on the conflict itself.' },
+  'economist.com': { name:'The Economist', type:'Magazine', country:'UK', language:'English', founded:'1843', ownership:'Economist Group (Agnelli family, staff)', agenda:'British liberal (classical liberal) weekly. Supports two-state solution, rules-based international order, and is critical of both Israeli settlement expansion and Palestinian terrorism. Editorially independent, globally influential among policymakers and business elites.' },
+  'middleeasteye.net': { name:'Middle East Eye', type:'News website', country:'UK', language:'English', founded:'2014', ownership:'Jamal Khashoggi/various (Qatari-aligned)', agenda:'Online news site with strong sympathies toward the Muslim Brotherhood, Qatar, and Palestinian resistance movements. Frequently cited by pro-Palestinian activists. Critical of Israel, Egypt, UAE, and Saudi Arabia. Has been described by critics as a Qatari media influence project.' },
+  'almonitor.com': { name:'Al-Monitor', type:'News website', country:'USA', language:'English', founded:'2012', ownership:'Jamal Daniel', agenda:'Middle East-focused news and analysis. Centrist, aiming for insider regional coverage. Has faced questions about funding transparency but is generally regarded as a useful source for policy analysis across the political spectrum.' },
+  'i24news.tv': { name:'i24NEWS', type:'TV & news website', country:'Israel', language:'English/French/Arabic', founded:'2013', ownership:'Patrick Drahi (Altice)', agenda:'International news channel based in Israel. Aims for mainstream international audience. Generally pro-Israel in framing but attempts to cover multiple perspectives. Significant French-language audience.' },
+  'foreignpolicy.com': { name:'Foreign Policy', type:'Magazine', country:'USA', language:'English', founded:'1970', ownership:'Graham Holdings', agenda:'US foreign policy magazine. Centrist-realist orientation, focuses on geopolitics and diplomacy. Has published significant critical analysis of both Israeli and Palestinian policy. Influential in DC foreign policy circles.' },
+  'atlanticcouncil.org': { name:'Atlantic Council', type:'Think tank', country:'USA', language:'English', founded:'1961', ownership:'Non-profit (various corporate/government donors)', agenda:'Transatlantic foreign policy think tank. Generally supportive of NATO, liberal international order, and US-Israel relationship. Center to center-right on Israel-Palestine, with significant pro-Israel voices on staff.' },
+  'tabletmag.com': { name:'Tablet Magazine', type:'Online magazine', country:'USA', language:'English', founded:'2009', ownership:'Nextbook (non-profit)', agenda:'American Jewish online magazine. Center-right to right on Israel, strong defender of Israel\'s military actions, critical of left-wing Jewish groups and BDS. Significant influence in American Jewish conservative discourse. Publishes serious cultural and political analysis.' },
+  'memri.org': { name:'MEMRI (Middle East Media Research Institute)', type:'Research institute', country:'USA', language:'English', founded:'1998', ownership:'Non-profit (co-founded by former Israeli intelligence officer)', agenda:'Translates and distributes content from Arabic, Persian, and other Middle Eastern media. Widely used by pro-Israel advocates to highlight extremist content in Arab media. Critics argue it selectively translates content to portray Arabs/Muslims negatively. Has co-founders with Israeli intelligence backgrounds.' },
+  'le-monde.fr': { name:'Le Monde', type:'Newspaper', country:'France', language:'French', founded:'1944', ownership:'Le Monde Group (various investors)', agenda:'France\'s newspaper of record. Center-left, internationalist, strong on human rights. Has published critical coverage of Israeli military conduct alongside analysis of Hamas and Palestinian governance. Influential in French and Francophone political discourse.' },
+  'lemonde.fr': { name:'Le Monde', type:'Newspaper', country:'France', language:'French', founded:'1944', ownership:'Le Monde Group', agenda:'See le-monde.fr.' },
+  'derspiegel.de': { name:'Der Spiegel', type:'Magazine', country:'Germany', language:'German', founded:'1947', ownership:'Spiegel-Verlag (staff/various)', agenda:'Germany\'s leading news magazine. Center-left, strong on investigative journalism. German political context shapes its coverage — Germany\'s historical responsibility creates a distinctive balance between strong support for Israel\'s right to exist and criticism of specific policies.' },
+  'spiegel.de': { name:'Der Spiegel', type:'Magazine', country:'Germany', language:'German', founded:'1947', ownership:'Spiegel-Verlag', agenda:'See derspiegel.de.' },
+};
 
-Respond ONLY with valid JSON, no preamble, no markdown:
+async function researchPublicationWithClaude(domain) {
+  // Check static database first
+  if (PUBLICATION_DB[domain]) {
+    return PUBLICATION_DB[domain];
+  }
+  // Dynamic fallback — Claude with web search
+  const prompt = `Research the news publication at domain "${domain}" and provide a factual profile.
+
+Provide:
+1. name: Full publication name
+2. type: Type (newspaper, TV channel, news website, magazine, wire service, etc.)
+3. country: Country of origin
+4. language: Primary language(s)
+5. founded: Year founded
+6. ownership: Owner or parent company
+7. agenda: 2-3 sentences describing the publication's editorial orientation, political leanings, known biases, and overall agenda. Be factual and specific.
+
+Respond ONLY with valid JSON:
 {
   "name": "...",
-  "bio": "...",
-  "location": "...",
-  "handles": ["X: @handle", "Website: example.com"]
+  "type": "...",
+  "country": "...",
+  "language": "...",
+  "founded": "...",
+  "ownership": "...",
+  "agenda": "..."
 }`;
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 800, temperature: 0, messages: [{ role: 'user', content: prompt }] })
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-5', max_tokens: 600, temperature: 0,
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      messages: [{ role: 'user', content: prompt }]
+    })
+  });
+  if (!response.ok) throw new Error('Claude API error: ' + response.status);
+  const data = await response.json();
+  const raw = data.content.map(c => c.text || '').join('').trim();
+  const clean = raw.replace(/```json|```/g, '').trim();
+  try { return JSON.parse(clean); } catch(e) { return { name: domain, type: 'News website', agenda: 'Publication information not available.' }; }
+}
+
+async function researchActorWithClaude(handle, url, isNews) {
+  const context = isNews
+    ? `This person is a journalist or contributor at a news publication. URL context: ${url || ''}`
+    : `This is a social media account. ${url ? `Profile URL context: ${url}` : ''}`;
+
+  const prompt = `You are an open-source intelligence (OSINT) researcher. Research the following ${isNews ? 'journalist or public figure' : 'social media account'} and provide a factual profile.
+
+${isNews ? `Name/byline: ${handle}` : `Account handle: @${handle}`}
+${context}
+
+Provide:
+1. name: Full real name (if publicly known). If unknown, use the handle.
+2. bio: Factual 2-paragraph summary — background, what they are known for, political or ideological stance, notable work or affiliations. If anonymous or low-profile, state that clearly.
+3. location: Country or city (if publicly known). "Unknown" if not established.
+4. handles: Array of known social media handles, websites, or other online presence. Format: "X: @handle", "Website: domain.com". Only verified or highly likely matches.
+
+Be factual and neutral. Do not speculate beyond what is publicly known.
+
+Respond ONLY with valid JSON:
+{
+  "name": "...",
+  "bio": "...",
+  "location": "...",
+  "handles": ["X: @handle"]
+}`;
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-5', max_tokens: 800, temperature: 0,
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      messages: [{ role: 'user', content: prompt }]
+    })
   });
   if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error('Claude API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
-  const raw = data.content.map(c => c.text || '').join('').trim();
+  const raw = data.content.filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
   const clean = raw.replace(/```json|```/g, '').trim();
   return JSON.parse(clean);
 }
