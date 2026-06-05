@@ -1,5 +1,13 @@
 # Who's Behind That? — Server Changelog
 
+### v1.13.0 (server) | Admin: v2.7.0 | Client: v1.8.0
+- News domain detection: 60+ outlets across Israeli and international press
+- Article scraping: tries article body selectors, falls back to OpenGraph meta tags
+- Hybrid publication research: static DB with 35+ major outlets (instant, no tokens), Claude web search for unknown outlets
+- Actor research updated: includes publication profile for news URLs, uses web_search tool for better actor results
+- New actors table in PostgreSQL: stores all actor searches with source, deviceId, actor/publication data
+- New GET /actors/list endpoint for admin history sync
+
 ### v1.12.4 — bug fix (server) | Admin: v2.3.1 | Client: v1.5.1
 - Added whosbehindthat.com and admin.whosbehindthat.com to CORS allowed origins
 
