@@ -1,5 +1,11 @@
 # Who's Behind That? — Server Changelog
 
+### v1.15.0 (server) | Admin: v2.8.0 | Client: v1.9.1
+- Token tracking: all Claude API calls log input/output token counts
+- input_tokens/output_tokens columns added to scans and actors tables
+- New GET /stats endpoint: token totals broken down by post scans (admin/client) and actor scans
+- Token counts included in fetch-and-analyze and research-actor API responses
+
 ### v1.14.0 (server) | Admin: v2.7.0 | Client: v1.9.0
 - Entity format in scoring prompt compacted: shorter field labels, reduced char limits, comments omitted when empty
 - ~15-20% fewer input tokens per scan, no impact on scoring quality
