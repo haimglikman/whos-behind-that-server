@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v1.14.0 (server) | Admin: v2.7.0 | Client: v1.9.0
+- Entity format in scoring prompt compacted: shorter field labels, reduced char limits, comments omitted when empty
+- ~15-20% fewer input tokens per scan, no impact on scoring quality
+
 ### v1.13.0 (server) | Admin: v2.7.0 | Client: v1.8.0
 - News domain detection: 60+ outlets across Israeli and international press
 - Article scraping: tries article body selectors, falls back to OpenGraph meta tags
