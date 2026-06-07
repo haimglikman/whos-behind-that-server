@@ -5,7 +5,12 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.14.0 — Entity format in scoring prompt compacted: shorter field labels,
+// v1.15.0 — Token tracking: all Claude API calls now log input/output tokens.
+//            input_tokens/output_tokens columns added to scans and actors tables.
+//            /stats endpoint returns token totals broken down by post/actor/source.
+//            Token counts included in fetch-and-analyze and research-actor responses.
+//
+// v1.14.0 — Entity format compacted for ~15-20% token savings.
 //            reduced per-field char limits, comments only when present.
 //            ~15-20% fewer input tokens per scan, no impact on scoring.
 //
@@ -60,7 +65,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.14.0';
+const SERVER_VERSION = '1.15.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -137,6 +142,10 @@ async function initDB() {
       );
     `);
     await db.query(`ALTER TABLE scans ADD COLUMN IF NOT EXISTS platform TEXT;`);
+    await db.query(`ALTER TABLE scans ADD COLUMN IF NOT EXISTS input_tokens INTEGER DEFAULT 0;`);
+    await db.query(`ALTER TABLE scans ADD COLUMN IF NOT EXISTS output_tokens INTEGER DEFAULT 0;`);
+    await db.query(`ALTER TABLE actors ADD COLUMN IF NOT EXISTS input_tokens INTEGER DEFAULT 0;`);
+    await db.query(`ALTER TABLE actors ADD COLUMN IF NOT EXISTS output_tokens INTEGER DEFAULT 0;`);
     await db.query(`
       CREATE TABLE IF NOT EXISTS actors (
         id TEXT PRIMARY KEY,
@@ -224,7 +233,8 @@ app.post('/fetch-and-analyze', async (req, res) => {
     if (postData.text.length < minLen) return res.status(422).json({ error: `Fetched text is too short (${postData.text.length} chars). Please paste the article text manually.` });
     const analysis = await scoreWithClaude(postData.text, entities);
     const responseUrl = postData.normalizedUrl || url;
-    res.json({ success: true, platform, post: postData, analysis, url: responseUrl });
+    const tokens = analysis._tokens || { input: 0, output: 0 };
+    res.json({ success: true, platform, post: postData, analysis, url: responseUrl, inputTokens: tokens.input, outputTokens: tokens.output });
   } catch (err) {
     console.error('fetch-and-analyze error:', err.message);
     res.status(500).json({ error: err.message });
@@ -241,21 +251,23 @@ app.post('/research-actor', async (req, res) => {
   try {
     const isNews = url && isNewsDomain(url);
     const domain = isNews ? extractDomain(url) : null;
-    // Run author and publication research in parallel if news
     const [actor, publication] = await Promise.all([
       researchActorWithClaude(handle, url, isNews),
       isNews ? researchPublicationWithClaude(domain) : Promise.resolve(null)
     ]);
-    // Save to DB
+    const actorTokens = (actor._tokens?.input || 0) + (publication?._tokens?.input || 0);
+    const actorTokensOut = (actor._tokens?.output || 0) + (publication?._tokens?.output || 0);
+    console.log(`[TOKENS] actor research: in=${actorTokens} out=${actorTokensOut}`);
     if (db && actorScanId) {
       await db.query(
-        `INSERT INTO actors (id, ts, handle, source, device_id, app_version, server_version, actor_data, publication_data, url)
-         VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (id) DO NOTHING`,
+        `INSERT INTO actors (id, ts, handle, source, device_id, app_version, server_version, actor_data, publication_data, url, input_tokens, output_tokens)
+         VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (id) DO NOTHING`,
         [actorScanId, handle, source || 'admin', deviceId || null, appVersion || '', SERVER_VERSION,
-         JSON.stringify(actor), publication ? JSON.stringify(publication) : null, url || null]
+         JSON.stringify(actor), publication ? JSON.stringify(publication) : null, url || null,
+         actorTokens, actorTokensOut]
       ).catch(e => console.warn('Actor DB save failed:', e.message));
     }
-    res.json({ success: true, actor, publication, isNews });
+    res.json({ success: true, actor, publication, isNews, inputTokens: actorTokens, outputTokens: actorTokensOut });
   } catch (err) {
     console.error('research-actor error:', err.message);
     res.status(500).json({ error: err.message });
@@ -292,19 +304,53 @@ app.get('/actors/list', async (req, res) => {
   }
 });
 
+// GET /stats
+// ─────────────────────────────────────────────
+app.get('/stats', async (req, res) => {
+  if (!db) return res.json({ success: true, stats: {} });
+  try {
+    const scansResult = await db.query(
+      `SELECT source, SUM(input_tokens) as input_tokens, SUM(output_tokens) as output_tokens, COUNT(*) as count
+       FROM scans GROUP BY source`
+    );
+    const actorsResult = await db.query(
+      `SELECT SUM(input_tokens) as input_tokens, SUM(output_tokens) as output_tokens, COUNT(*) as count
+       FROM actors`
+    );
+    const stats = { post: { admin: { in: 0, out: 0, count: 0 }, client: { in: 0, out: 0, count: 0 } }, actor: { in: 0, out: 0, count: 0 } };
+    scansResult.rows.forEach(r => {
+      const src = r.source || 'admin';
+      if (stats.post[src]) {
+        stats.post[src].in += parseInt(r.input_tokens) || 0;
+        stats.post[src].out += parseInt(r.output_tokens) || 0;
+        stats.post[src].count += parseInt(r.count) || 0;
+      }
+    });
+    if (actorsResult.rows[0]) {
+      stats.actor.in = parseInt(actorsResult.rows[0].input_tokens) || 0;
+      stats.actor.out = parseInt(actorsResult.rows[0].output_tokens) || 0;
+      stats.actor.count = parseInt(actorsResult.rows[0].count) || 0;
+    }
+    res.json({ success: true, stats });
+  } catch(e) {
+    console.error('stats error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─────────────────────────────────────────────
 // POST /history/save
 // ─────────────────────────────────────────────
 app.post('/history/save', async (req, res) => {
   if (!db) return res.status(503).json({ error: 'Database not configured' });
-  const { id, ts, url, platform, source, deviceId, postText, overallScore, overallLabel, topMatches, textAI, hasImage, appVersion, serverVersion, fullResult } = req.body;
+  const { id, ts, url, platform, source, deviceId, postText, overallScore, overallLabel, topMatches, textAI, hasImage, appVersion, serverVersion, fullResult, inputTokens, outputTokens } = req.body;
   if (!id || !url) return res.status(400).json({ error: 'id and url are required' });
   try {
     await db.query(
-      `INSERT INTO scans (id, ts, url, platform, source, device_id, post_text, overall_score, overall_label, top_matches, text_ai, has_image, app_version, server_version, comment, full_result)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, '', $15)
+      `INSERT INTO scans (id, ts, url, platform, source, device_id, post_text, overall_score, overall_label, top_matches, text_ai, has_image, app_version, server_version, comment, full_result, input_tokens, output_tokens)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, '', $15, $16, $17)
        ON CONFLICT (id) DO NOTHING`,
-      [id, ts || new Date().toISOString(), url, platform || null, source || 'admin', deviceId || null, postText || '', overallScore || 0, overallLabel || '', topMatches || [], textAI || 5, hasImage || false, appVersion || '', serverVersion || '', fullResult ? JSON.stringify(fullResult) : null]
+      [id, ts || new Date().toISOString(), url, platform || null, source || 'admin', deviceId || null, postText || '', overallScore || 0, overallLabel || '', topMatches || [], textAI || 5, hasImage || false, appVersion || '', serverVersion || '', fullResult ? JSON.stringify(fullResult) : null, inputTokens || 0, outputTokens || 0]
     );
     res.json({ success: true, id });
   } catch (err) {
@@ -340,7 +386,7 @@ app.get('/history/list', async (req, res) => {
     if (deviceId) { where.push(`device_id = $${idx++}`); params.push(deviceId); }
     const whereClause = where.length ? 'WHERE ' + where.join(' AND ') : '';
     const result = await db.query(
-      `SELECT id, ts, url, platform, source, device_id, post_text, overall_score, overall_label, top_matches, text_ai, has_image, app_version, server_version, comment, full_result
+      `SELECT id, ts, url, platform, source, device_id, post_text, overall_score, overall_label, top_matches, text_ai, has_image, app_version, server_version, comment, full_result, input_tokens, output_tokens
        FROM scans ${whereClause} ORDER BY ts DESC LIMIT 500`,
       params
     );
@@ -359,7 +405,8 @@ app.get('/history/list', async (req, res) => {
       overallLabel: r.overall_label, topMatches: r.top_matches,
       textAI: r.text_ai, hasImage: r.has_image,
       appVersion: r.app_version, serverVersion: r.server_version,
-      comment: r.comment || '', fullResult: r.full_result
+      comment: r.comment || '', fullResult: r.full_result,
+      inputTokens: r.input_tokens || 0, outputTokens: r.output_tokens || 0
     }));
     let filtered = rows;
     if (alignmentType === 'primary') filtered = rows.filter(r => r.fullResult?.matches?.some(m => !m.secondary));
@@ -780,17 +827,25 @@ Respond ONLY with valid JSON:
   const data = await response.json();
   const raw = data.content.map(c => c.text || '').join('').trim();
   const clean = raw.replace(/```json|```/g, '').trim();
-  try { return JSON.parse(clean); } catch(e) { return null; }
+  try {
+    const result = JSON.parse(clean);
+    result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
+    return result;
+  } catch(e) { return null; }
 }
 
 async function scoreWithClaude(postText, entities) {
-  // Pre-translate non-English posts for better semantic matching
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+
   let enrichedText = postText;
   if (isNonEnglish(postText)) {
     try {
       const translation = await translatePost(postText);
       if (translation) {
         enrichedText = `ORIGINAL TEXT:\n${postText}\n\nENGLISH TRANSLATION:\n${translation.translation}\n\nPOLITICAL CONTEXT:\n${translation.political_context}`;
+        totalInputTokens += translation._tokens?.input || 0;
+        totalOutputTokens += translation._tokens?.output || 0;
         console.log('Post translated for scoring. Political context:', translation.political_context.slice(0, 150));
       }
     } catch(e) {
@@ -806,24 +861,27 @@ async function scoreWithClaude(postText, entities) {
   for (const result of batchResults) {
     if (result.text_ai_score) text_ai_score = result.text_ai_score;
     if (result.text_ai_reason) text_ai_reason = result.text_ai_reason;
+    totalInputTokens += result._tokens?.input || 0;
+    totalOutputTokens += result._tokens?.output || 0;
     for (const match of (result.matches || [])) {
       if (!allMatches.find(m => m.id === match.id)) allMatches.push(match);
     }
   }
   allMatches.sort((a, b) => b.pct - a.pct);
 
-  // Run coherence check on matches above 60%
   const candidates = allMatches.filter(m => m.pct >= 60);
   let finalMatches = allMatches;
   if (candidates.length > 1) {
     try {
       const coherent = await coherenceCheck(enrichedText, candidates, entities);
-      const coherentIds = new Set(coherent.map(m => m.id));
+      totalInputTokens += coherent._tokens?.input || 0;
+      totalOutputTokens += coherent._tokens?.output || 0;
+      const coherentIds = new Set(coherent.map ? coherent.map(m => m.id) : []);
       finalMatches = allMatches.map(m => {
         if (!coherentIds.has(m.id) && m.pct >= 60) {
           return Object.assign({}, m, { pct: Math.min(m.pct, 50), why: '', missing: '', alignment: '' });
         }
-        const refined = coherent.find(c => c.id === m.id);
+        const refined = Array.isArray(coherent) ? coherent.find(c => c.id === m.id) : null;
         return refined ? Object.assign({}, m, refined) : m;
       });
     } catch(e) {
@@ -831,7 +889,8 @@ async function scoreWithClaude(postText, entities) {
     }
   }
 
-  return { text_ai_score, text_ai_reason, matches: finalMatches };
+  console.log(`[TOKENS] scan total: in=${totalInputTokens} out=${totalOutputTokens}`);
+  return { text_ai_score, text_ai_reason, matches: finalMatches, _tokens: { input: totalInputTokens, output: totalOutputTokens } };
 }
 
 async function coherenceCheck(postText, candidates, allEntities) {
@@ -898,7 +957,9 @@ Respond ONLY with valid JSON — the filtered list of matches to KEEP:
   const raw = data.content.map(c => c.text || '').join('').trim();
   const clean = raw.replace(/```json|```/g, '').trim();
   const result = JSON.parse(clean);
-  return result.matches || [];
+  const matches = result.matches || [];
+  matches._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
+  return matches;
 }
 
 // Pre-process entities into compact format at call time (saves ~15-20% tokens)
@@ -1032,7 +1093,9 @@ Respond ONLY with valid JSON, no preamble, no markdown:
   const data = await response.json();
   const raw = data.content.map(c => c.text || '').join('').trim();
   const clean = raw.replace(/```json|```/g, '').trim();
-  return JSON.parse(clean);
+  const result = JSON.parse(clean);
+  result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
+  return result;
 }
 
 // ─────────────────────────────────────────────
@@ -1209,7 +1272,9 @@ Respond ONLY with valid JSON:
   const data = await response.json();
   const raw = data.content.filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
   const clean = raw.replace(/```json|```/g, '').trim();
-  return JSON.parse(clean);
+  const result = JSON.parse(clean);
+  result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
+  return result;
 }
 
 // ─────────────────────────────────────────────
