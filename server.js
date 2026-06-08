@@ -5,6 +5,9 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.15.1 — Robust JSON extraction for actor/publication research — handles
+//            Claude preamble text before JSON (e.g. "Based on my research...").
+//
 // v1.15.0 — Token tracking: all Claude API calls now log input/output tokens.
 //            input_tokens/output_tokens columns added to scans and actors tables.
 //            /stats endpoint returns token totals broken down by post/actor/source.
@@ -65,7 +68,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.15.0';
+const SERVER_VERSION = '1.15.1';
 
 import express from 'express';
 import cors from 'cors';
@@ -1230,7 +1233,7 @@ Respond ONLY with valid JSON:
   const data = await response.json();
   const raw = data.content.map(c => c.text || '').join('').trim();
   const clean = raw.replace(/```json|```/g, '').trim();
-  try { return JSON.parse(clean); } catch(e) { return { name: domain, type: 'News website', agenda: 'Publication information not available.' }; }
+  try { const result = extractJSON(raw); result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 }; return result; } catch(e) { return { name: domain, type: 'News website', agenda: 'Publication information not available.' }; }
 }
 
 async function researchActorWithClaude(handle, url, isNews) {
@@ -1271,8 +1274,7 @@ Respond ONLY with valid JSON:
   if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error('Claude API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
   const raw = data.content.filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
-  const clean = raw.replace(/```json|```/g, '').trim();
-  const result = JSON.parse(clean);
+  const result = extractJSON(raw);
   result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
   return result;
 }
@@ -1280,6 +1282,17 @@ Respond ONLY with valid JSON:
 // ─────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────
+function extractJSON(text) {
+  // Strip markdown fences
+  let s = text.replace(/```json|```/g, '').trim();
+  // Find first { and last } to handle preamble/postamble text
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start !== -1 && end !== -1 && end > start) {
+    s = s.slice(start, end + 1);
+  }
+  return JSON.parse(s);
+}
 function stripHtml(html) { return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); }
 
 // ─────────────────────────────────────────────
