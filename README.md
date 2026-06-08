@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.15.1 — bug fix (server) | Admin: v2.9.4 | Client: v1.9.3
+- Fixed actor research failing with JSON parse error when Claude adds preamble text before the JSON response — now extracts JSON robustly regardless of surrounding text
+
 ### v1.15.0 (server) | Admin: v2.8.0 | Client: v1.9.1
 - Token tracking: all Claude API calls log input/output token counts
 - input_tokens/output_tokens columns added to scans and actors tables
