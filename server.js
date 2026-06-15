@@ -5,7 +5,11 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.15.1 — Robust JSON extraction for actor/publication research — handles
+// v1.16.0 — Entity refresh endpoint: POST /entities/refresh takes an array
+//            of entities, queries Claude with web search for each, returns
+//            changed fields and change descriptions.
+//
+// v1.15.1 — Robust JSON extraction for actor/publication research.
 //            Claude preamble text before JSON (e.g. "Based on my research...").
 //
 // v1.15.0 — Token tracking: all Claude API calls now log input/output tokens.
@@ -68,7 +72,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.15.1';
+const SERVER_VERSION = '1.16.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -273,6 +277,68 @@ app.post('/research-actor', async (req, res) => {
     res.json({ success: true, actor, publication, isNews, inputTokens: actorTokens, outputTokens: actorTokensOut });
   } catch (err) {
     console.error('research-actor error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /entities/refresh
+// ─────────────────────────────────────────────
+app.post('/entities/refresh', async (req, res) => {
+  const { entities } = req.body;
+  if (!entities || !entities.length) return res.status(400).json({ error: 'entities array is required' });
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured' });
+  try {
+    const results = await Promise.all(entities.map(async (entity) => {
+      const prompt = `You are a political analyst maintaining an entity database for an AI tool that analyzes narrative alignment in the Israeli-Palestinian conflict and Israeli domestic politics.
+
+Review this entity profile and update it based on the latest publicly available information:
+
+Entity: ${entity.name}
+Type: ${entity.type}
+Current narrative: ${entity.narrative || ''}
+Current interest: ${entity.interest || ''}
+Current MO: ${entity.mo || ''}
+Current comments: ${entity.comments || ''}
+
+Search for recent news and developments about this entity. Then:
+1. Determine if any field needs updating based on recent developments
+2. If yes, provide updated text for the changed fields only
+3. If nothing significant has changed, return changed:false
+
+Focus on: new political positions, changed tactics, election developments, major events, shifts in alliances or stated goals.
+Do NOT update for minor day-to-day news. Only update for meaningful strategic or behavioral shifts.
+
+Respond ONLY with valid JSON:
+{
+  "changed": true/false,
+  "changes": ["brief description of what changed"],
+  "narrative": "updated text or null if unchanged",
+  "interest": "updated text or null if unchanged",
+  "mo": "updated text or null if unchanged",
+  "comments": "updated text or null if unchanged"
+}`;
+
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-5', max_tokens: 1000, temperature: 0,
+          tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+          messages: [{ role: 'user', content: prompt }]
+        })
+      });
+      if (!response.ok) throw new Error(`API error for ${entity.name}: ${response.status}`);
+      const data = await response.json();
+      const raw = data.content.filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
+      const result = extractJSON(raw);
+      result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
+      result.entityId = entity.id;
+      result.entityName = entity.name;
+      return result;
+    }));
+    res.json({ success: true, results });
+  } catch(err) {
+    console.error('entities/refresh error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
