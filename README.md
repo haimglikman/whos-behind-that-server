@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+
+### v1.16.0 (server) | Admin: v2.10.0 | Client: v1.10.2
+- New POST /entities/refresh endpoint: takes array of entities, queries Claude with web search for each in batches of 5, returns changed fields and descriptions
+
 ### v1.15.1 — bug fix (server) | Admin: v2.9.4 | Client: v1.9.3
 - Fixed actor research failing with JSON parse error when Claude adds preamble text before the JSON response — now extracts JSON robustly regardless of surrounding text
 
