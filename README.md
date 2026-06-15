@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.16.1 — bug fix (server) | Admin: v2.10.1 | Client: v1.10.2
+- Refresh endpoint now uses Promise.allSettled — one entity failure no longer aborts the entire batch
+- Graceful JSON parse error handling per entity — returns changed:false instead of throwing
 
 ### v1.16.0 (server) | Admin: v2.10.0 | Client: v1.10.2
 - New POST /entities/refresh endpoint: takes array of entities, queries Claude with web search for each in batches of 5, returns changed fields and descriptions
