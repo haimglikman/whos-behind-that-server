@@ -5,6 +5,9 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.16.1 — Refresh endpoint: use Promise.allSettled so one entity failure
+//            doesn't kill the whole batch; graceful JSON parse error handling.
+//
 // v1.16.0 — Entity refresh endpoint: POST /entities/refresh takes an array
 //            of entities, queries Claude with web search for each, returns
 //            changed fields and change descriptions.
@@ -72,7 +75,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.16.0';
+const SERVER_VERSION = '1.16.1';
 
 import express from 'express';
 import cors from 'cors';
@@ -288,7 +291,7 @@ app.post('/entities/refresh', async (req, res) => {
   if (!entities || !entities.length) return res.status(400).json({ error: 'entities array is required' });
   if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured' });
   try {
-    const results = await Promise.all(entities.map(async (entity) => {
+    const results = await Promise.allSettled(entities.map(async (entity) => {
       const prompt = `You are a political analyst maintaining an entity database for an AI tool that analyzes narrative alignment in the Israeli-Palestinian conflict and Israeli domestic politics.
 
 Review this entity profile and update it based on the latest publicly available information:
@@ -327,16 +330,31 @@ Respond ONLY with valid JSON:
           messages: [{ role: 'user', content: prompt }]
         })
       });
-      if (!response.ok) throw new Error(`API error for ${entity.name}: ${response.status}`);
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}));
+        throw new Error(`API error for ${entity.name}: ${response.status} ${errBody.error?.message || ''}`);
+      }
       const data = await response.json();
       const raw = data.content.filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
-      const result = extractJSON(raw);
-      result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
-      result.entityId = entity.id;
-      result.entityName = entity.name;
-      return result;
+      if (!raw) return { changed: false, entityId: entity.id, entityName: entity.name, _tokens: { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 } };
+      try {
+        const result = extractJSON(raw);
+        result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
+        result.entityId = entity.id;
+        result.entityName = entity.name;
+        return result;
+      } catch(parseErr) {
+        console.warn(`JSON parse failed for ${entity.name}:`, parseErr.message);
+        return { changed: false, entityId: entity.id, entityName: entity.name, error: 'Parse error', _tokens: { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 } };
+      }
     }));
-    res.json({ success: true, results });
+    // Flatten allSettled results — treat rejected as unchanged
+    const flatResults = results.map((r, i) => {
+      if (r.status === 'fulfilled') return r.value;
+      console.warn(`Entity refresh failed for index ${i}:`, r.reason?.message);
+      return { changed: false, entityId: entities[i].id, entityName: entities[i].name, error: r.reason?.message };
+    });
+    res.json({ success: true, results: flatResults });
   } catch(err) {
     console.error('entities/refresh error:', err.message);
     res.status(500).json({ error: err.message });
