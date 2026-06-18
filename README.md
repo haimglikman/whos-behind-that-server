@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.16.2 — bug fix (server) | Admin: v2.10.2 | Client: v1.12.0
+- Strip citation markup injected by web_search tool from actor bio field before returning
+
 ### v1.16.1 — bug fix (server) | Admin: v2.10.1 | Client: v1.10.2
 - Refresh endpoint now uses Promise.allSettled — one entity failure no longer aborts the entire batch
 - Graceful JSON parse error handling per entity — returns changed:false instead of throwing
