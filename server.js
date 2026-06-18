@@ -5,6 +5,8 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.16.2 — Strip citation markup from actor bio returned by web_search tool.
+//
 // v1.16.1 — Refresh endpoint: use Promise.allSettled so one entity failure
 //            doesn't kill the whole batch; graceful JSON parse error handling.
 //
@@ -75,7 +77,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.16.1';
+const SERVER_VERSION = '1.16.2';
 
 import express from 'express';
 import cors from 'cors';
@@ -1359,6 +1361,9 @@ Respond ONLY with valid JSON:
   const data = await response.json();
   const raw = data.content.filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
   const result = extractJSON(raw);
+  // Strip citation markup that web_search tool injects (e.g. <cite index="1-2">text</cite>)
+  if (result.bio) result.bio = result.bio.replace(/<cite[^>]*>(.*?)<\/cite>/gs, '$1').replace(/\[\d+\]/g, '').trim();
+  if (result.name) result.name = result.name.replace(/<cite[^>]*>(.*?)<\/cite>/gs, '$1').trim();
   result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
   return result;
 }
