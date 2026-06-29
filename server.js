@@ -5,6 +5,38 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.18.3 — PATCH /clusters/rename endpoint for user-editable cluster names.
+//
+// v1.18.2 — isolated_post_ids added to clusters.
+//            omitted posts identically to the live investigation view.
+//
+// v1.18.1 — postSummaries added to synthesize.
+//            post_summaries column added to clusters table; clusters/save and
+//            clusters/list updated accordingly.
+//
+// v1.18.0 — Clusters history.
+//            GET /clusters/list. Cluster IDs generated client-side same format
+//            as post IDs (WBT-CLU-...).
+//
+// v1.17.5 — Buffer-based unicode sanitization.
+//            surrogates from Hebrew/Arabic/emoji text in both detect and synthesize.
+//
+// v1.17.4 — Sanitize post text before sending to API — removes unpaired
+//            Unicode surrogates (emoji, Arabic/Hebrew chars) that caused 400 errors.
+//
+// v1.17.3 — Better error logging in investigate/detect to surface root cause.
+//
+// v1.17.2 — Fixed extractJSON to handle JSON arrays.
+//            investigation detection which returns an array of pair results).
+//
+// v1.17.1 — Optimized investigation token usage.
+//            batches 4 pairs per call, and uses trimmed prompts (~75% cost
+//            reduction vs v1.17.0). Stage 2 prompt also trimmed.
+//
+// v1.17.0 — Investigation endpoints.
+//            connection detection per post pair) and POST /investigate/synthesize
+//            (Stage 2 — synopsis + cluster name for connected posts).
+//
 // v1.16.2 — Strip citation markup from actor bio returned by web_search tool.
 //
 // v1.16.1 — Refresh endpoint: use Promise.allSettled so one entity failure
@@ -77,7 +109,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.16.2';
+const SERVER_VERSION = '1.18.3';
 
 import express from 'express';
 import cors from 'cors';
@@ -172,12 +204,97 @@ async function initDB() {
         url TEXT
       );
     `);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS clusters (
+        id TEXT PRIMARY KEY,
+        ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        cluster_name TEXT,
+        synopsis TEXT,
+        dominant_entity TEXT,
+        connection_type TEXT,
+        frame TEXT,
+        event TEXT,
+        post_ids TEXT[],
+        isolated_post_ids TEXT[],
+        post_summaries JSONB,
+        post_count INTEGER,
+        source TEXT DEFAULT 'admin',
+        device_id TEXT,
+        app_version TEXT,
+        server_version TEXT
+      );
+    `);
     console.log('Database ready. Table scans exists or was created.');
   } catch (err) {
     console.error('DB init error:', err.message);
     db = null;
   }
 }
+
+// ─────────────────────────────────────────────
+// POST /clusters/save
+// ─────────────────────────────────────────────
+app.post('/clusters/save', async (req, res) => {
+  const { id, clusterId, clusterName, synopsis, dominantEntity, connectionType, frame, event, postIds, isolatedPostIds, postSummaries, postCount, source, deviceId, appVersion } = req.body;
+  const clustId = clusterId || id;
+  if (!clustId) return res.status(400).json({ error: 'clusterId required' });
+  if (!db) return res.json({ success: true, warning: 'DB not available' });
+  try {
+    await db.query(`ALTER TABLE clusters ADD COLUMN IF NOT EXISTS post_summaries JSONB`);
+    await db.query(`ALTER TABLE clusters ADD COLUMN IF NOT EXISTS isolated_post_ids TEXT[]`);
+    await db.query(
+      `INSERT INTO clusters (id, cluster_name, synopsis, dominant_entity, connection_type, frame, event, post_ids, isolated_post_ids, post_summaries, post_count, source, device_id, app_version, server_version)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       ON CONFLICT (id) DO UPDATE SET cluster_name=$2, synopsis=$3, post_summaries=$10`,
+      [clustId, clusterName||'', synopsis||'', dominantEntity||'', connectionType||'', frame||'', event||'', postIds||[], isolatedPostIds||[], JSON.stringify(postSummaries||[]), postCount||0, source||'admin', deviceId||null, appVersion||'', SERVER_VERSION]
+    );
+    res.json({ success: true });
+  } catch(err) {
+    console.error('clusters/save error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /clusters/list
+// ─────────────────────────────────────────────
+app.get('/clusters/list', async (req, res) => {
+  if (!db) return res.json({ success: true, clusters: [] });
+  try {
+    const result = await db.query(
+      `SELECT id, ts, cluster_name, synopsis, dominant_entity, connection_type, frame, event, post_ids, isolated_post_ids, post_summaries, post_count, source, device_id, app_version, server_version
+       FROM clusters ORDER BY ts DESC LIMIT 200`
+    );
+    res.json({ success: true, clusters: result.rows.map(r => ({
+      id: r.id, ts: r.ts, clusterName: r.cluster_name, synopsis: r.synopsis,
+      dominantEntity: r.dominant_entity, connectionType: r.connection_type,
+      frame: r.frame, event: r.event, postIds: r.post_ids,
+      isolatedPostIds: r.isolated_post_ids || [],
+      postSummaries: r.post_summaries || [],
+      postCount: r.post_count,
+      source: r.source, deviceId: r.device_id, appVersion: r.app_version, serverVersion: r.server_version
+    }))});
+  } catch(err) {
+    console.error('clusters/list error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// PATCH /clusters/rename
+// ─────────────────────────────────────────────
+app.patch('/clusters/rename', async (req, res) => {
+  const { clusterId, clusterName } = req.body;
+  if (!clusterId) return res.status(400).json({ error: 'clusterId required' });
+  if (!db) return res.json({ success: true, warning: 'DB not available' });
+  try {
+    await db.query(`UPDATE clusters SET cluster_name=$1 WHERE id=$2`, [clusterName||'', clusterId]);
+    res.json({ success: true });
+  } catch(err) {
+    console.error('clusters/rename error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ─────────────────────────────────────────────
 // HEALTH CHECK
@@ -520,6 +637,196 @@ app.patch('/history/comment', async (req, res) => {
     res.json({ success: true, id });
   } catch (err) {
     console.error('history/comment error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /investigate/detect
+// ─────────────────────────────────────────────
+// Stage 1: for each pair of posts in the batch, detect whether a meaningful
+// connection exists. Returns connection graph — only pairs that pass threshold.
+app.post('/investigate/detect', async (req, res) => {
+  const { posts } = req.body;
+  if (!posts || posts.length < 2) return res.status(400).json({ error: 'At least 2 posts required' });
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured' });
+  try {
+    // Build all pairs
+    const pairs = [];
+    for (let i = 0; i < posts.length; i++) {
+      for (let j = i + 1; j < posts.length; j++) {
+        pairs.push([posts[i], posts[j]]);
+      }
+    }
+
+    // Optimization 1: batch pairs — 4 pairs per Claude call instead of 1
+    // Optimization 2: use Haiku for detection (pattern matching, not deep synthesis)
+    // Optimization 3: trim prompts — lead with structured data, short text excerpt only
+    const BATCH_SIZE = 4;
+    const allResults = [];
+
+    // Safe string: remove unpaired surrogates and non-printable chars
+    const safe = (s, max) => {
+      if (!s) return '';
+      return Buffer.from(String(s).replace(/[\uD800-\uDFFF]/g, ''), 'utf8')
+        .toString('utf8')
+        .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+        .slice(0, max || 200)
+        .replace(/\n/g, ' ')
+        .trim();
+    };
+
+    for (let b = 0; b < pairs.length; b += BATCH_SIZE) {
+      const batch = pairs.slice(b, b + BATCH_SIZE);
+
+      const pairsText = batch.map(([a, bPost], idx) => {
+        const aDate = a.ts ? new Date(a.ts).toISOString().slice(0,10) : '?';
+        const bDate = bPost.ts ? new Date(bPost.ts).toISOString().slice(0,10) : '?';
+        const aExcerpt = safe(a.postText, 150);
+        const bExcerpt = safe(bPost.postText, 150);
+        const aAlign = safe((a.topMatches||[]).slice(0,2).join('+') || 'none', 80);
+        const bAlign = safe((bPost.topMatches||[]).slice(0,2).join('+') || 'none', 80);
+        return `PAIR ${idx+1}:\nA: [${aDate}] alignment=${aAlign} (${a.overallScore||0}%) | "${aExcerpt}"\nB: [${bDate}] alignment=${bAlign} (${bPost.overallScore||0}%) | "${bExcerpt}"`;
+      }).join('\n\n');
+
+      const prompt = `You are a narrative analyst for Who's Behind That?, focused on the Israeli-Palestinian conflict and Israeli domestic politics.
+
+For each pair below, decide if there is a meaningful NARRATIVE CONNECTION — same framing goal, coordination signal, narrative escalation, or explicit reference. Not just topical overlap.
+
+${pairsText}
+
+Respond ONLY with a JSON array, one object per pair, in order:
+[
+  {
+    "pair": 1,
+    "connected": true/false,
+    "connectionType": "narrative reinforcement"|"coordination signal"|"narrative escalation"|"explicit reference"|null,
+    "strength": "strong"|"medium"|"weak"|null,
+    "reasoning": "one sentence"
+  }
+]`;
+
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 800,
+          temperature: 0,
+          messages: [{ role: 'user', content: prompt }]
+        })
+      });
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}));
+        console.error('Haiku API error:', response.status, JSON.stringify(errBody));
+        throw new Error(`API error ${response.status}: ${errBody.error?.message || 'unknown'}`);
+      }
+      const data = await response.json();
+      const raw = data.content.filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
+      if (!raw) throw new Error('Empty response from API');
+      let batchResults;
+      try {
+        batchResults = extractJSON(raw);
+      } catch(parseErr) {
+        console.error('JSON parse error, raw response:', raw.slice(0, 500));
+        throw new Error('Failed to parse API response: ' + parseErr.message);
+      }
+      const totalTokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
+
+      // Map batch results back to their pairs
+      batch.forEach(([a, bPost], idx) => {
+        const r = Array.isArray(batchResults) ? batchResults[idx] : batchResults;
+        allResults.push({
+          postA: a.scanId,
+          postB: bPost.scanId,
+          connected: r?.connected || false,
+          connectionType: r?.connectionType || null,
+          strength: r?.strength || null,
+          reasoning: r?.reasoning || '',
+          _tokens: totalTokens
+        });
+      });
+    }
+
+    const connections = allResults.filter(r => r.connected);
+
+    // Build clusters using union-find
+    const postIds = posts.map(p => p.scanId);
+    const parent = {};
+    postIds.forEach(id => { parent[id] = id; });
+    function find(x) { return parent[x] === x ? x : (parent[x] = find(parent[x])); }
+    function union(x, y) { parent[find(x)] = find(y); }
+    connections.forEach(c => union(c.postA, c.postB));
+
+    const clusterMap = {};
+    postIds.forEach(id => {
+      const root = find(id);
+      if (!clusterMap[root]) clusterMap[root] = [];
+      clusterMap[root].push(id);
+    });
+
+    const clusters = Object.values(clusterMap).filter(c => c.length > 1);
+    const isolated = postIds.filter(id => !clusters.flat().includes(id));
+
+    res.json({ success: true, connections, clusters, isolated });
+  } catch(err) {
+    console.error('investigate/detect error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /investigate/synthesize
+// ─────────────────────────────────────────────
+// Stage 2: for each cluster of connected posts, generate a synopsis + cluster name.
+app.post('/investigate/synthesize', async (req, res) => {
+  const { cluster, posts } = req.body;
+  if (!cluster || !posts || posts.length < 2) return res.status(400).json({ error: 'cluster array and posts array required' });
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured' });
+  try {
+    const clusterPosts = posts.filter(p => cluster.includes(p.scanId));
+    const safe3 = (s, max) => {
+      if (!s) return '';
+      return Buffer.from(String(s).replace(/[\uD800-\uDFFF]/g, ''), 'utf8')
+        .toString('utf8').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+        .slice(0, max || 300).replace(/\n/g, ' ').trim();
+    };
+    const postsText = clusterPosts.map((p, i) => {
+      const date = p.ts ? new Date(p.ts).toISOString().slice(0,10) : '?';
+      const excerpt = safe3(p.postText, 300);
+      const alignment = safe3((p.topMatches||[]).slice(0,2).join('+') || 'none', 80);
+      return `POST ${i+1} [${date}] alignment=${alignment} (${p.overallScore||0}%): "${excerpt}"`;
+    }).join('\n\n');
+
+    const prompt = `Narrative analyst for Who's Behind That? (Israeli-Palestinian conflict / Israeli politics).
+
+These ${clusterPosts.length} posts share narrative connections. Synthesize them.
+
+${postsText}
+
+Respond ONLY with valid JSON:
+{
+  "clusterName": "3-6 word name: [topic framing] · [entity]",
+  "synopsis": "2-4 sentences: what narrative is constructed, what pattern emerges, whose interests served",
+  "dominantEntity": "entity name",
+  "connectionType": "narrative reinforcement"|"coordination signal"|"narrative escalation"|"explicit reference",
+  "frame": "overarching frame/arc",
+  "event": "specific event or null",
+  "postSummaries": ["one sentence narrative summary for POST 1", "one sentence for POST 2", ...]
+}`;
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 900, temperature: 0, messages: [{ role: 'user', content: prompt }] })
+    });
+    if (!response.ok) throw new Error(`API error: ${response.status}`);
+    const data = await response.json();
+    const raw = data.content.filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
+    const result = extractJSON(raw);
+    result.postIds = cluster;
+    result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
+    res.json({ success: true, synthesis: result });
+  } catch(err) {
+    console.error('investigate/synthesize error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1374,11 +1681,15 @@ Respond ONLY with valid JSON:
 function extractJSON(text) {
   // Strip markdown fences
   let s = text.replace(/```json|```/g, '').trim();
-  // Find first { and last } to handle preamble/postamble text
-  const start = s.indexOf('{');
-  const end = s.lastIndexOf('}');
-  if (start !== -1 && end !== -1 && end > start) {
-    s = s.slice(start, end + 1);
+  // Handle arrays starting with [
+  const arrStart = s.indexOf('[');
+  const objStart = s.indexOf('{');
+  if (arrStart !== -1 && (objStart === -1 || arrStart < objStart)) {
+    const end = s.lastIndexOf(']');
+    if (end !== -1) s = s.slice(arrStart, end + 1);
+  } else if (objStart !== -1) {
+    const end = s.lastIndexOf('}');
+    if (end !== -1) s = s.slice(objStart, end + 1);
   }
   return JSON.parse(s);
 }
