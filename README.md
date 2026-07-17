@@ -1,5 +1,15 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.3 (server) | Admin: v2.14.3
+- Prompt management system: new prompts table in DB
+- GET /prompts/list, GET /prompts/history/:name, POST /prompts/save, POST /prompts/activate/:id
+- In-memory prompt cache — loaded from DB on startup, refreshed immediately when admin saves
+- All 6 prompts (scan, coherence, connection, synopsis, actor, convergent) now use model from cache
+
+### v1.22.2 (server) | Admin: v2.14.2 | Client: v1.16.2 - NEVER TRIED, JUMPED DIRECTLY TO 1.22.3
+- Cluster detection: weak connections now filtered out — only medium and strong connections form clusters
+- Cluster detection: prompt tightened to explicitly exclude same-day posts about the same event from opposing camps (news cycle proximity is not a connection)
+
 ### v1.22.1 (server) | Admin: v2.14.2 | Client: v1.16.2
 - Added entities table to DB
 - GET /entities/list — returns current entity list with version
