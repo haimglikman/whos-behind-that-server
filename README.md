@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.4 — bug fix (server) | Admin: v2.15.0
+- Fixed ReferenceError on startup: promptCache was calling getModel() during its own initialization
+
 ### v1.22.3 (server) | Admin: v2.14.3
 - Prompt management system: new prompts table in DB
 - GET /prompts/list, GET /prompts/history/:name, POST /prompts/save, POST /prompts/activate/:id
