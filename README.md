@@ -5,7 +5,7 @@
 - GET /entities/list — returns current entity list with version
 - POST /entities/save — stores entity list from admin
 
-### v1.22.0 (server — live) | Client: v1.16.0 | Admin: v2.14.0
+### v1.22.0 (server — live) | Admin: v2.14.0 | Client: v1.16.0 
 - First live production release — based on dev v1.21.0
 - All YouTube features, cluster investigation, FAQ, cross-device reconstruction
 
