@@ -9,6 +9,19 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
+// v1.22.3 — Prompt management system:
+//            - New prompts table in DB (name, version, model, prompt_text, is_active)
+//            - GET /prompts/list, GET /prompts/history/:name, POST /prompts/save,
+//              POST /prompts/activate/:id endpoints
+//            - In-memory prompt cache loaded from DB on startup
+//            - All 6 prompts (scan, coherence, connection, synopsis, actor,
+//              convergent) now use model from cache; admin can edit via UI
+//
+// v1.22.2 — Tightened cluster connection detection.
+//            - Weak connections now filtered out (only medium/strong accepted)
+//            - Detection prompt made more explicit: same-day posts about same
+//              event from opposing camps are NOT a connection.
+//
 // v1.21.0 — YouTube performance improvements:
 //            - Meta check and transcript fetch now run in parallel (Promise.all)
 //              instead of sequentially — saves 300-500ms per scan.
@@ -177,7 +190,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.1';
+const SERVER_VERSION = '1.22.3';
 
 import express from 'express';
 import cors from 'cors';
@@ -187,6 +200,57 @@ import pg from 'pg';
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || '';
 const TRANSCRIPT_API_KEY = process.env.transcriptapi_API_KEY || '';
+
+// In-memory prompt cache — loaded from DB on startup, refreshed when admin saves
+const promptCache = {
+  scan:       { model: 'claude-sonnet-4-5', text: null },
+  coherence:  { model: 'claude-sonnet-4-5', text: null },
+  connection: { model: getModel('connection'), text: null },
+  synopsis:   { model: 'claude-sonnet-4-5', text: null },
+  actor:      { model: 'claude-sonnet-4-5', text: null },
+  convergent: { model: 'claude-sonnet-4-5', text: null }
+};
+
+// Seed default prompts on first boot
+const DEFAULT_PROMPTS = {
+  scan: {
+    model: 'claude-sonnet-4-5',
+    version: '1.0.0',
+    text: 'You are a senior analyst specializing in geopolitical influence operations, information warfare, and social media manipulation. [FULL SCAN PROMPT — loaded from DB]'
+  },
+  coherence: { model: 'claude-sonnet-4-5', version: '1.0.0', text: 'You are a senior geopolitical analyst. A scoring engine has identified the following entities as potentially aligned with a social media post. [FULL COHERENCE PROMPT — loaded from DB]' },
+  connection: { model: 'claude-haiku-4-5-20251001', version: '1.0.0', text: 'You are a narrative analyst for Who\'s Behind That?, focused on the Israeli-Palestinian conflict and Israeli domestic politics. [FULL CONNECTION PROMPT — loaded from DB]' },
+  synopsis: { model: 'claude-sonnet-4-5', version: '1.0.0', text: 'Narrative analyst for Who\'s Behind That? (Israeli-Palestinian conflict / Israeli politics). [FULL SYNOPSIS PROMPT — loaded from DB]' },
+  actor: { model: 'claude-sonnet-4-5', version: '1.0.0', text: 'You are an open-source intelligence (OSINT) researcher. [FULL ACTOR PROMPT — loaded from DB]' },
+  convergent: { model: 'claude-sonnet-4-5', version: '1.0.0', text: 'You are a senior geopolitical analyst. A social media post primarily serves: [entities]. [FULL CONVERGENT PROMPT — loaded from DB]' }
+};
+
+async function loadPromptsFromDB() {
+  if (!db) return;
+  try {
+    const count = await db.query(`SELECT COUNT(*) FROM prompts`);
+    if (parseInt(count.rows[0].count) === 0) {
+      console.log('No prompts in DB — admin must seed them via the Prompts tab.');
+    }
+    const result = await db.query(
+      `SELECT DISTINCT ON (name) name, model, prompt_text FROM prompts WHERE is_active=TRUE ORDER BY name, created_at DESC`
+    );
+    result.rows.forEach(r => {
+      if (promptCache[r.name]) {
+        promptCache[r.name].model = r.model;
+        promptCache[r.name].text = r.prompt_text;
+      }
+    });
+    console.log('Prompts loaded from DB:', result.rows.length);
+  } catch(e) { console.warn('Could not load prompts from DB:', e.message); }
+}
+
+function getPrompt(name) {
+  return promptCache[name]?.text || null;
+}
+function getModel(name) {
+  return promptCache[name]?.model || 'claude-sonnet-4-5';
+}
 
 const { Pool } = pg;
 const app = express();
@@ -305,6 +369,15 @@ async function initDB() {
         sort_order INTEGER DEFAULT 0,
         active BOOLEAN DEFAULT TRUE
       );
+      CREATE TABLE IF NOT EXISTS prompts (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        version TEXT NOT NULL DEFAULT '1.0.0',
+        model TEXT NOT NULL,
+        prompt_text TEXT NOT NULL,
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
       CREATE TABLE IF NOT EXISTS entities (
         id TEXT PRIMARY KEY,
         data JSONB NOT NULL,
@@ -363,6 +436,7 @@ async function initDB() {
       console.log('FAQ: seeded ' + faqs.length + ' default items.');
     }
     console.log('Database ready. Table scans exists or was created.');
+    await loadPromptsFromDB();
   } catch (err) {
     console.error('DB init error:', err.message);
     db = null;
@@ -544,8 +618,84 @@ app.post('/entities/save', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-// HEALTH CHECK
+// GET /prompts/list
 // ─────────────────────────────────────────────
+app.get('/prompts/list', async (req, res) => {
+  if (!db) return res.json({ success: false, error: 'DB not available' });
+  try {
+    const result = await db.query(
+      `SELECT DISTINCT ON (name) id, name, version, model, prompt_text, created_at
+       FROM prompts WHERE is_active=TRUE ORDER BY name, created_at DESC`
+    );
+    res.json({ success: true, prompts: result.rows });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /prompts/history/:name
+// ─────────────────────────────────────────────
+app.get('/prompts/history/:name', async (req, res) => {
+  if (!db) return res.json({ success: false, error: 'DB not available' });
+  try {
+    const result = await db.query(
+      `SELECT id, name, version, model, prompt_text, is_active, created_at
+       FROM prompts WHERE name=$1 ORDER BY created_at DESC LIMIT 50`,
+      [req.params.name]
+    );
+    res.json({ success: true, history: result.rows });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /prompts/save
+// ─────────────────────────────────────────────
+app.post('/prompts/save', async (req, res) => {
+  const { name, version, model, prompt_text } = req.body;
+  if (!name || !model || !prompt_text) return res.status(400).json({ error: 'name, model, prompt_text required' });
+  if (!db) return res.json({ success: true, warning: 'DB not available' });
+  try {
+    // Deactivate previous versions for this prompt
+    await db.query(`UPDATE prompts SET is_active=FALSE WHERE name=$1`, [name]);
+    // Insert new version
+    await db.query(
+      `INSERT INTO prompts (name, version, model, prompt_text, is_active) VALUES ($1,$2,$3,$4,TRUE)`,
+      [name, version || '1.0.0', model, prompt_text]
+    );
+    // Reload into cache immediately
+    if (promptCache[name]) {
+      promptCache[name].model = model;
+      promptCache[name].text = prompt_text;
+    }
+    res.json({ success: true });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /prompts/activate/:id — roll back to a specific version
+// ─────────────────────────────────────────────
+app.post('/prompts/activate/:id', async (req, res) => {
+  if (!db) return res.json({ success: true, warning: 'DB not available' });
+  try {
+    const row = await db.query(`SELECT * FROM prompts WHERE id=$1`, [req.params.id]);
+    if (!row.rows.length) return res.status(404).json({ error: 'Version not found' });
+    const p = row.rows[0];
+    await db.query(`UPDATE prompts SET is_active=FALSE WHERE name=$1`, [p.name]);
+    await db.query(`UPDATE prompts SET is_active=TRUE WHERE id=$1`, [req.params.id]);
+    if (promptCache[p.name]) {
+      promptCache[p.name].model = p.model;
+      promptCache[p.name].text = p.prompt_text;
+    }
+    res.json({ success: true });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: "Who's Behind That? API", version: SERVER_VERSION, db: !!db });
 });
@@ -939,7 +1089,18 @@ app.post('/investigate/detect', async (req, res) => {
 
       const prompt = `You are a narrative analyst for Who's Behind That?, focused on the Israeli-Palestinian conflict and Israeli domestic politics.
 
-For each pair below, decide if there is a meaningful NARRATIVE CONNECTION — same framing goal, coordination signal, narrative escalation, or explicit reference. Not just topical overlap.
+For each pair below, decide if there is a meaningful NARRATIVE CONNECTION. The bar is HIGH — connection requires more than topical overlap or being published on the same day about the same event.
+
+A REAL connection means:
+- The posts share the same specific framing goal (not just the same topic)
+- One post directly responds to or escalates the other's narrative
+- Both posts push the same specific claim or talking point
+- There are signs of coordination (same language, same framing, same sequence)
+
+NOT a connection:
+- Two posts about the same event from opposing camps (that's just the news cycle)
+- Two posts published on the same day about the same political figure
+- Topical similarity without shared narrative purpose
 
 ${pairsText}
 
@@ -996,7 +1157,7 @@ Respond ONLY with a JSON array, one object per pair, in order:
       });
     }
 
-    const connections = allResults.filter(r => r.connected);
+    const connections = allResults.filter(r => r.connected && r.strength !== 'weak');
 
     // Build clusters using union-find
     const postIds = posts.map(p => p.scanId);
@@ -1065,7 +1226,7 @@ Respond ONLY with valid JSON:
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 900, temperature: 0, messages: [{ role: 'user', content: prompt }] })
+      body: JSON.stringify({ model: getModel('synopsis'), max_tokens: 900, temperature: 0, messages: [{ role: 'user', content: getPrompt('synopsis') || prompt }] })
     });
     if (!response.ok) throw new Error(`API error: ${response.status}`);
     const data = await response.json();
@@ -1156,7 +1317,7 @@ Or: { "found": false }`;
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 600, temperature: 0, messages: [{ role: 'user', content: prompt }] })
+    body: JSON.stringify({ model: getModel('convergent'), max_tokens: 600, temperature: 0, messages: [{ role: 'user', content: getPrompt('convergent') || prompt }] })
   });
   if (!response.ok) { const err = await response.json().catch(()=>({})); throw new Error('Claude API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
@@ -1611,7 +1772,7 @@ Respond ONLY with valid JSON:
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 800, temperature: 0, messages: [{ role: 'user', content: prompt }] })
+    body: JSON.stringify({ model: getModel('actor'), max_tokens: 800, temperature: 0, messages: [{ role: 'user', content: prompt }] })
   });
   if (!response.ok) return null;
   const data = await response.json();
@@ -1740,7 +1901,7 @@ Respond ONLY with valid JSON — the filtered list of matches to KEEP:
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 1500, temperature: 0, messages: [{ role: 'user', content: prompt }] })
+    body: JSON.stringify({ model: getModel('coherence'), max_tokens: 1500, temperature: 0, messages: [{ role: 'user', content: getPrompt('coherence') || prompt }] })
   });
   if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error('Coherence check API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
@@ -1877,7 +2038,7 @@ Respond ONLY with valid JSON, no preamble, no markdown:
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 2000, temperature: 0, messages: [{ role: 'user', content: prompt }] })
+    body: JSON.stringify({ model: getModel('scan'), max_tokens: 2000, temperature: 0, messages: [{ role: 'user', content: getPrompt('scan') || prompt }] })
   });
   if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error('Claude API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
