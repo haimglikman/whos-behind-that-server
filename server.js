@@ -5,9 +5,11 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v1.22.0 — First live production release. Based on dev v1.21.0.
+// v1.21.1 — Entity DB: added entities table, GET /entities/list and
+//            POST /entities/save endpoints. Admin pushes entities on every
+//            save/refresh/import. Client loads entities on page load.
 //
-// v1.21.0 — YouTube performance improvements.
+// v1.21.0 — YouTube performance improvements:
 //            - Meta check and transcript fetch now run in parallel (Promise.all)
 //              instead of sequentially — saves 300-500ms per scan.
 //            - In-memory transcript cache (up to 100 entries) — repeat scans
@@ -175,7 +177,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.0';
+const SERVER_VERSION = '1.22.1';
 
 import express from 'express';
 import cors from 'cors';
@@ -302,6 +304,13 @@ async function initDB() {
         faq_group TEXT DEFAULT 'General',
         sort_order INTEGER DEFAULT 0,
         active BOOLEAN DEFAULT TRUE
+      );
+      CREATE TABLE IF NOT EXISTS entities (
+        id TEXT PRIMARY KEY,
+        data JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_by TEXT DEFAULT 'admin',
+        version TEXT DEFAULT '1.0.0'
       );
     `);
     // Seed default FAQs if table is empty
@@ -495,6 +504,41 @@ app.delete('/faq/:id', async (req, res) => {
     res.json({ success: true });
   } catch(err) {
     console.error('faq/delete error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /entities/list
+// ─────────────────────────────────────────────
+app.get('/entities/list', async (req, res) => {
+  if (!db) return res.json({ success: false, error: 'DB not available' });
+  try {
+    const result = await db.query(`SELECT data, updated_at, version FROM entities ORDER BY updated_at DESC LIMIT 1`);
+    if (result.rows.length === 0) return res.json({ success: false, error: 'No entities found' });
+    res.json({ success: true, entities: result.rows[0].data, updatedAt: result.rows[0].updated_at, version: result.rows[0].version });
+  } catch(err) {
+    console.error('entities/list error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /entities/save
+// ─────────────────────────────────────────────
+app.post('/entities/save', async (req, res) => {
+  const { entities, version } = req.body;
+  if (!entities || !Array.isArray(entities)) return res.status(400).json({ error: 'entities array required' });
+  if (!db) return res.json({ success: true, warning: 'DB not available' });
+  try {
+    await db.query(
+      `INSERT INTO entities (id, data, updated_at, version) VALUES ('main', $1, NOW(), $2)
+       ON CONFLICT (id) DO UPDATE SET data=$1, updated_at=NOW(), version=$2`,
+      [JSON.stringify(entities), version || '1.0.0']
+    );
+    res.json({ success: true });
+  } catch(err) {
+    console.error('entities/save error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
