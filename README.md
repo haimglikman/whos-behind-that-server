@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.1 (server) | Admin: v2.14.2 | Client: v1.16.2
+- Added entities table to DB
+- GET /entities/list — returns current entity list with version
+- POST /entities/save — stores entity list from admin
+
 ### v1.22.0 (server — live) | Client: v1.16.0 | Admin: v2.14.0
 - First live production release — based on dev v1.21.0
 - All YouTube features, cluster investigation, FAQ, cross-device reconstruction
