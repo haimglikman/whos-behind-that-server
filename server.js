@@ -9,7 +9,11 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.3 — Prompt management system:
+// v1.22.4 — bug fix: promptCache referenced getModel() during initialization
+//            causing ReferenceError on startup. Fixed by using plain string
+//            defaults in promptCache object literal.
+//
+// v1.22.3 — Prompt management system.
 //            - New prompts table in DB (name, version, model, prompt_text, is_active)
 //            - GET /prompts/list, GET /prompts/history/:name, POST /prompts/save,
 //              POST /prompts/activate/:id endpoints
@@ -190,7 +194,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.3';
+const SERVER_VERSION = '1.22.4';
 
 import express from 'express';
 import cors from 'cors';
@@ -205,7 +209,7 @@ const TRANSCRIPT_API_KEY = process.env.transcriptapi_API_KEY || '';
 const promptCache = {
   scan:       { model: 'claude-sonnet-4-5', text: null },
   coherence:  { model: 'claude-sonnet-4-5', text: null },
-  connection: { model: getModel('connection'), text: null },
+  connection: { model: 'claude-haiku-4-5-20251001', text: null },
   synopsis:   { model: 'claude-sonnet-4-5', text: null },
   actor:      { model: 'claude-sonnet-4-5', text: null },
   convergent: { model: 'claude-sonnet-4-5', text: null }
