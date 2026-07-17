@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.0 (server — live) | Client: v1.16.0 | Admin: v2.14.0
+- First live production release — based on dev v1.21.0
+- All YouTube features, cluster investigation, FAQ, cross-device reconstruction
+
 ### v1.16.2 — bug fix (server) | Admin: v2.10.2 | Client: v1.12.0
 - Strip citation markup injected by web_search tool from actor bio field before returning
 
