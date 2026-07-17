@@ -5,6 +5,104 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.22.0 — First live production release. Based on dev v1.21.0.
+//
+// v1.21.0 — YouTube performance improvements.
+//            - Meta check and transcript fetch now run in parallel (Promise.all)
+//              instead of sequentially — saves 300-500ms per scan.
+//            - In-memory transcript cache (up to 100 entries) — repeat scans
+//              of the same video return instantly without using a TranscriptAPI credit.
+//
+// v1.20.9 — Fixed TranscriptAPI response parsing.
+//
+// v1.20.8 — Debug logging.
+//            Correct endpoint: /api/v2/youtube/transcript?video_url=...
+//            Correct response field: segments[] not transcript[].
+//
+// v1.20.6 — Switched to TranscriptAPI.com.
+//            Clean REST API, handles cloud IP blocking, 100 free credits/month.
+//            Requires transcriptapi_API_KEY env var on Render.
+//
+// v1.20.5 — Switched to page HTML approach.
+//            caption track baseUrl from ytInitialPlayerResponse. More reliable
+//            than timedtext or innertube API approaches.
+//
+// v1.20.4 — Switched to YouTube innertube API.
+//            same internal API YouTube's own frontend uses, works for ASR
+//            (auto-generated) captions without OAuth authentication.
+//
+// v1.20.3 — Rewrote fetchYoutubeTranscript.
+//            across multiple languages first, then falls back to captions API
+//            list + srv3. Previous json3 format caused "Unexpected end of JSON"
+//            errors on many videos.
+//
+// v1.20.2 — YouTube scanning limits.
+//            - Videos longer than 10 minutes are rejected with a clear message.
+//            - Live/streaming videos are rejected with a clear message.
+//            Both checks use the YouTube Data API v3 video metadata endpoint.
+//
+// v1.20.1 — Switched to YouTube Data API v3.
+//            package (blocked by YouTube CAPTCHA on cloud IPs) to YouTube Data
+//            API v3 + timedtext endpoint. Requires YOUTUBE_API_KEY env var.
+//            Removed youtube-transcript dependency from package.json.
+//
+// v1.20.0 — YouTube transcript support.
+//              falls back to manual text entry if no transcript available.
+//            - News articles with embedded YouTube videos: transcripts fetched
+//              and appended to article text automatically. If no transcript
+//              available, analysis proceeds on article text only with a note.
+//            - YouTube added as a platform in detectPlatform().
+//
+// v1.19.4 — bug fix: posts column missing from clusters/list SELECT query.
+//            posts were being saved correctly but never returned.
+//
+// v1.19.3 — clusters store full posts array.
+//            overallScore, ts) so admin can reconstruct client clusters without
+//            needing client's localStorage.
+//
+// v1.19.2 — clusters/list device_id filter.
+//            passes its own device_id to see only its clusters; admin omits it
+//            to see all.
+//
+// v1.19.1 — seeded 32 default FAQs.
+//            Terminology, Scanning logic, Technical, Privacy).
+//
+// v1.19.0 — connections column, FAQ endpoints.
+//            postCount now includes isolated posts; FAQ table + GET /faq/list,
+//            POST /faq/save, DELETE /faq/:id endpoints.
+//
+// v1.18.3 — PATCH /clusters/rename.
+//
+// v1.18.2 — isolated_post_ids added to clusters.
+//            omitted posts identically to the live investigation view.
+//
+// v1.18.1 — postSummaries added to synthesize.
+//            post_summaries column added to clusters table; clusters/save and
+//            clusters/list updated accordingly.
+//
+// v1.18.0 — Clusters history.
+//            GET /clusters/list. Cluster IDs generated client-side same format
+//            as post IDs (WBT-CLU-...).
+//
+// v1.17.5 — Buffer-based unicode sanitization.
+//            surrogates from Hebrew/Arabic/emoji text in both detect and synthesize.
+//
+// v1.17.4 — Sanitize post text before sending to API — removes unpaired
+//            Unicode surrogates (emoji, Arabic/Hebrew chars) that caused 400 errors.
+//
+// v1.17.3 — Better error logging in investigate/detect to surface root cause.
+//
+// v1.17.2 — Fixed extractJSON to handle JSON arrays.
+//            investigation detection which returns an array of pair results).
+//
+// v1.17.1 — Optimized investigation token usage.
+//            batches 4 pairs per call, and uses trimmed prompts (~75% cost
+//            reduction vs v1.17.0). Stage 2 prompt also trimmed.
+//
+// v1.17.0 — Investigation endpoints.
+//            connection detection per post pair) and POST /investigate/synthesize
+//            (Stage 2 — synopsis + cluster name for connected posts).
+//
 // v1.16.2 — Strip citation markup from actor bio returned by web_search tool.
 //
 // v1.16.1 — Refresh endpoint: use Promise.allSettled so one entity failure
@@ -77,13 +175,16 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.16.2';
+const SERVER_VERSION = '1.22.0';
 
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
 import pg from 'pg';
+
+const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || '';
+const TRANSCRIPT_API_KEY = process.env.transcriptapi_API_KEY || '';
 
 const { Pool } = pg;
 const app = express();
@@ -172,12 +273,231 @@ async function initDB() {
         url TEXT
       );
     `);
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS clusters (
+        id TEXT PRIMARY KEY,
+        ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        cluster_name TEXT,
+        synopsis TEXT,
+        dominant_entity TEXT,
+        connection_type TEXT,
+        frame TEXT,
+        event TEXT,
+        post_ids TEXT[],
+        isolated_post_ids TEXT[],
+        post_summaries JSONB,
+        connections JSONB,
+        posts JSONB,
+        post_count INTEGER,
+        source TEXT DEFAULT 'admin',
+        device_id TEXT,
+        app_version TEXT,
+        server_version TEXT
+      );
+      CREATE TABLE IF NOT EXISTS faq (
+        id SERIAL PRIMARY KEY,
+        ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        question TEXT NOT NULL,
+        answer TEXT NOT NULL,
+        faq_group TEXT DEFAULT 'General',
+        sort_order INTEGER DEFAULT 0,
+        active BOOLEAN DEFAULT TRUE
+      );
+    `);
+    // Seed default FAQs if table is empty
+    const faqCount = await db.query(`SELECT COUNT(*) FROM faq`);
+    if (parseInt(faqCount.rows[0].count) === 0) {
+      const faqs = [
+        // Terminology
+        [1,'What is an entity?','An entity is any political actor, organization, government, movement, or ideological group whose interests the tool tracks. Examples include Benjamin Netanyahu, The Palestinian Authority, The US government, the IDF, or the Israeli protest movement. Each entity has a defined profile — their known interests, tactics, and public narrative — that the AI uses to score whether a given post serves their agenda.','Terminology',1],
+        [2,'What is an actor?','An actor is the person or account behind a specific post — the author. When you research an actor, Who\'s Behind That? builds a profile of who they are: their background, known affiliations, political stance, and online presence. For news articles, actor research also profiles the publication itself — its editorial line, ownership, and known biases.','Terminology',2],
+        [3,'What is primary vs secondary alignment?','Primary alignment means the post actively serves an entity\'s interests — its framing, message, or targets work in their favor. Secondary alignment means the entity benefits indirectly — the post wasn\'t necessarily crafted for them, but spreading it helps them nonetheless. Think of primary as "this post works for them" and secondary as "they\'d be happy this post exists." Important to note: alignment does not mean the post was commissioned by the entity, that the author works for them, or that there\'s any direct connection — it simply reflects whose interests the content serves, intentionally or not.','Terminology',3],
+        [4,'What is Hidden Convergent Interest?','Hidden Convergent Interest is when two entities that are normally on opposite sides of the conflict both benefit from the same post — even if neither is the obvious intended audience. It reflects the idea that in a complex political landscape, a single piece of content can serve multiple agendas simultaneously, sometimes in ways that aren\'t immediately obvious. When Who\'s Behind That? detects this, it flags it as a separate finding so you can see not just who the post was likely written for, but also who quietly benefits from it being spread.','Terminology',4],
+        [5,'What is a Frame?','A Frame is the wide, ongoing context that a post sits within — broader than a single event, it\'s the overarching situation that gives the content its meaning. Examples include "the war with Iran" or "the Israeli elections." A Frame can contain many Events, and understanding which Frame a post belongs to helps identify whether it connects to other posts about the same situation.','Terminology',5],
+        [6,'What is an Event?','An Event is a specific, time-bounded happening that readers will immediately recognize — something like October 7th, the Nasrallah assassination, or the Hezbollah pager attack. Events sit within a broader Frame. A post scored as being "about" a particular Event is a candidate for connection with other posts about the same Event.','Terminology',6],
+        [7,'What is a Connection?','A Connection is the specific relationship detected between exactly two posts — what ties them together narratively. A connection exists when two posts share the same framing goal, show signs of coordination, reinforce each other\'s narrative, or form a meaningful pattern together. Not every pair of posts about the same topic has a connection — the relationship needs to be meaningful, not just topical.','Terminology',7],
+        [8,'What is a Cluster?','A Cluster is a group of posts that are all meaningfully connected to each other — directly or through shared connections. When you run an investigation, posts that pass the connection threshold are grouped into clusters. Posts that don\'t connect to any others remain isolated and are excluded from the synopsis.','Terminology',8],
+        [9,'What is a Synopsis?','A Synopsis is the synthesized narrative output generated for a connected cluster — a short text that describes what story is being told across the posts, what framing pattern emerges, and whose interests it serves. A Synopsis is only generated when real connections are found. If no connections exist in a batch of posts, no Synopsis is produced.','Terminology',9],
+        // Scanning logic
+        [10,'How does post scanning work?','When you submit a URL, the server automatically fetches the text of the post or article. That text is then analyzed by Claude AI, which scores it against all entities in the database simultaneously. Each entity is evaluated based on whether the post advances their strategic interests, matches their known methods, and echoes their public narrative. The highest-scoring entities above the threshold appear as primary or secondary alignments.','Scanning logic',1],
+        [11,'How does actor scanning work?','After a successful post scan, you\'re offered the option to research the account or author behind it. The server looks up publicly available information about them — their background, known affiliations, political stance, and online presence. For news articles, it also profiles the publication: its editorial line, ownership, and known biases. Results are generally accurate for well-known public figures but may be limited for anonymous or low-profile accounts.','Scanning logic',2],
+        [12,'Does the scan consider context beyond the post text?','Each scan is based solely on the post or article being analyzed — it is not influenced by the author\'s other posts, past scans, or any external context outside of what\'s in the text itself. That said, the engine considers two dimensions within the post: what it says (content) and who it attacks (context). If a post directly attacks a named political figure, the engine identifies who benefits from that attack and factors that into the score. Actor research is separate — it adds background on the author for your own interpretation, but does not feed back into the post\'s scoring.','Scanning logic',3],
+        [13,'Can you scan an actor without scanning a post first?','Not currently — actor research is triggered from a post scan result. This is intentional: Who\'s Behind That? is designed to analyze how content is framed, not to investigate individuals in isolation. The actor profile provides useful background for interpreting a specific scan, but the post itself is always the starting point.','Scanning logic',4],
+        [14,'Why do some posts score 0%?','A zero score means the AI found no meaningful alignment with any entity above the detection threshold. This can happen when a post is genuinely neutral or factual, when the content is too vague or short to score reliably, or occasionally when the model misses context it should have caught — particularly for posts that rely heavily on irony, cultural shorthand, or implicit references. If you believe a zero result is wrong, feel free to contact us.','Scanning logic',5],
+        [15,'What does the score percentage mean?','The score reflects how strongly a post serves a given entity\'s interests, on a scale of 0 to 100. It combines three factors: strategic interest alignment, tactical fingerprint, and narrative echo. Only entities scoring above 85% appear in your results — below that threshold the signal is considered too weak to be meaningful.','Scanning logic',6],
+        [16,'What\'s the difference between scanning a social media post and a news article?','Both are analyzed the same way — the text is scored against the entity database to detect whose narrative it serves. The difference is in what you\'re measuring: a social media post reflects what an individual chose to say and how they framed it; a news article reflects how a publication chose to cover a story, what angle it took, and what it emphasized or left out. Both are valid and meaningful signals.','Scanning logic',7],
+        [17,'I think the scan results were wrong','AI scoring is imperfect. The model may miss context, misread sarcasm, or fail to identify an indirect beneficiary — especially for posts that are ambiguous, highly local, or rely on cultural knowledge. If you consistently see wrong results for a certain type of post, you can contact us — it helps improve the model.','Scanning logic',8],
+        [18,'Are the entities interchangeable?','Yes — the entity database is designed to evolve with the political landscape. Entities can be added, edited, split, or removed to reflect new developments, shifting alliances, emerging figures, or entirely new topics. The database is versioned, so you can always see which version was used for any given scan.','Scanning logic',9],
+        [19,'How up to date is the entity database?','The database is updated periodically to reflect the current political landscape — new parties, splits, emerging figures, and shifting alliances. Each version is numbered, and every scan records which database version was used, so you can always trace results back to the entity set that produced them.','Scanning logic',10],
+        [20,'Can Who\'s Behind That? work for other topics?','Yes — in principle the tool can be adapted to any topic where narrative alignment matters. Currently it\'s built specifically for the Israeli-Palestinian conflict and Israeli domestic politics, and the results are most reliable within that scope. Applying it to other conflicts or political landscapes would require building a dedicated entity database for that domain, which is something we\'re open to exploring.','Scanning logic',11],
+        [21,'Are the entities static or dynamic?','The entity database is reviewed on a weekly basis and updated when meaningful developments occur — such as election results, shifting alliances, new political figures, or major strategic changes. Minor day-to-day news doesn\'t trigger updates; only changes that genuinely affect an entity\'s interests or behavior do.','Scanning logic',12],
+        // Technical
+        [22,'What languages are supported?','Posts in Hebrew and Arabic are automatically detected and pre-translated before scoring, with political context extracted as part of the process. English posts are scored directly. Other languages may work but results are less reliable.','Technical',1],
+        [23,'How does the Investigate feature work?','The Investigate tab lets you cross-analyze multiple posts together to detect narrative patterns that wouldn\'t be visible from a single scan. You add posts to an investigation basket from your history or directly from a scan result, then run the investigation when ready. The process works in two stages: first, every pair of posts is evaluated for a meaningful connection — same framing, coordinated narrative, or escalating pattern. Pairs that pass the threshold form clusters. Second, each cluster gets a synthesized synopsis describing what narrative is being constructed and whose interests it serves. Posts with no detected connections are excluded and noted separately. The basket persists across sessions so you can build an investigation over time.','Technical',2],
+        [24,'What platforms are supported? Does scanning work the same for all?','Who\'s Behind That? supports posts from X (Twitter), Facebook, and Instagram, as well as articles from major news and media websites including Ynet, Haaretz, Times of Israel, BBC, Al Jazeera, New York Times, and many others. The analysis itself works the same way across all platforms — once the text is retrieved, it goes through the same scoring process regardless of source. That said, every platform is built differently, and some are more restrictive than others when it comes to automated access. If scanning from a particular platform doesn\'t work, manually copying and pasting the text is always an option.','Technical',3],
+        [25,'I got an error when trying to scan a post','Who\'s Behind That? can only access publicly available content. Private social media posts, friends-only content, closed groups, and articles behind a paywall cannot be fetched — in those cases, you can paste the text manually instead. For Facebook and Instagram specifically, automated access is sometimes temporarily blocked by the platform — copying and pasting the post text manually is the best workaround. If the server is waking up from sleep, waiting 30 seconds and trying again usually resolves the issue.','Technical',4],
+        [26,'Does actor scanning count toward my daily quota?','Yes — each actor research uses one of your daily credits, the same as a post scan. This is because it involves an AI call which has a real cost.','Technical',5],
+        [27,'Can Who\'s Behind That? integrate with other platforms via API?','We\'d love to make that possible. API access isn\'t available yet — the tool is currently a web app only — but if you\'re interested in integration for research, journalism, or institutional use, we\'d be happy to hear from you at contact@whosbehindthat.com.','Technical',6],
+        // Privacy
+        [28,'Is login or identification required?','No login, account, or registration is required. Who\'s Behind That? uses a randomly generated device identifier stored in your browser to track your daily scan quota and link your local history — nothing more. There is no user profile, no email address, and no authentication of any kind. You can start scanning immediately.','Privacy',1],
+        [29,'Is Who\'s Behind That? free?','Yes — Who\'s Behind That? is free to use during the beta period. There are no subscription fees, no payment required, and no premium tier. The tool is currently limited to 10 scans per day per device to manage API costs, but this limit may be adjusted in future versions. If you need higher usage for research or institutional purposes, contact us at contact@whosbehindthat.com.','Privacy',2],
+        [30,'Can someone know what I scanned for?','Your scan history is stored locally on your device and is private to you. The service operator (Who\'s Behind That?) can see anonymized scan data — the post URL, content, and results — linked only to a randomly generated device identifier. No personal information is collected or visible to us: no IP address, no email, no device identifiers such as MAC address, and no account information of any kind. Your scans are never shared with third parties.','Privacy',3],
+        [31,'Is my data used to train AI models?','No. Your scan data is not used to train Claude or any other AI model. Post text is sent to Anthropic\'s Claude API for analysis and is subject to Anthropic\'s privacy policy, but Who\'s Behind That? does not share your data for training purposes.','Privacy',4],
+        [32,'Does Who\'s Behind That? use cookies?','No, Who\'s Behind That? does not use cookies. Instead, it uses your browser\'s local storage to keep track of an anonymous device identifier, your scan history, and your daily quota — all of which stay on your device and are never sent automatically with requests the way cookies are. There\'s no cross-site tracking and no third-party tracking technology involved.','Privacy',5],
+      ];
+      for (const [sortOrder, question, answer, group, so] of faqs) {
+        await db.query(
+          `INSERT INTO faq (question, answer, faq_group, sort_order) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
+          [question, answer, group, so]
+        );
+      }
+      console.log('FAQ: seeded ' + faqs.length + ' default items.');
+    }
     console.log('Database ready. Table scans exists or was created.');
   } catch (err) {
     console.error('DB init error:', err.message);
     db = null;
   }
 }
+
+// ─────────────────────────────────────────────
+// POST /clusters/save
+// ─────────────────────────────────────────────
+app.post('/clusters/save', async (req, res) => {
+  const { id, clusterId, clusterName, synopsis, dominantEntity, connectionType, frame, event, postIds, isolatedPostIds, postSummaries, connections, posts, postCount, source, deviceId, appVersion } = req.body;
+  const clustId = clusterId || id;
+  if (!clustId) return res.status(400).json({ error: 'clusterId required' });
+  if (!db) return res.json({ success: true, warning: 'DB not available' });
+  try {
+    await db.query(`ALTER TABLE clusters ADD COLUMN IF NOT EXISTS post_summaries JSONB`);
+    await db.query(`ALTER TABLE clusters ADD COLUMN IF NOT EXISTS isolated_post_ids TEXT[]`);
+    await db.query(`ALTER TABLE clusters ADD COLUMN IF NOT EXISTS connections JSONB`);
+    await db.query(`ALTER TABLE clusters ADD COLUMN IF NOT EXISTS posts JSONB`);
+    const totalCount = (postIds||[]).length + (isolatedPostIds||[]).length;
+    await db.query(
+      `INSERT INTO clusters (id, cluster_name, synopsis, dominant_entity, connection_type, frame, event, post_ids, isolated_post_ids, post_summaries, connections, posts, post_count, source, device_id, app_version, server_version)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+       ON CONFLICT (id) DO UPDATE SET cluster_name=$2, synopsis=$3, post_summaries=$10, connections=$11, posts=$12`,
+      [clustId, clusterName||'', synopsis||'', dominantEntity||'', connectionType||'', frame||'', event||'', postIds||[], isolatedPostIds||[], JSON.stringify(postSummaries||[]), JSON.stringify(connections||[]), JSON.stringify(posts||[]), totalCount, source||'admin', deviceId||null, appVersion||'', SERVER_VERSION]
+    );
+    res.json({ success: true });
+  } catch(err) {
+    console.error('clusters/save error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /clusters/list
+// ─────────────────────────────────────────────
+app.get('/clusters/list', async (req, res) => {
+  if (!db) return res.json({ success: true, clusters: [] });
+  const { device_id } = req.query;
+  try {
+    let query, params;
+    if (device_id) {
+      query = `SELECT id, ts, cluster_name, synopsis, dominant_entity, connection_type, frame, event, post_ids, isolated_post_ids, post_summaries, connections, posts, post_count, source, device_id, app_version, server_version
+               FROM clusters WHERE device_id=$1 ORDER BY ts DESC LIMIT 200`;
+      params = [device_id];
+    } else {
+      query = `SELECT id, ts, cluster_name, synopsis, dominant_entity, connection_type, frame, event, post_ids, isolated_post_ids, post_summaries, connections, posts, post_count, source, device_id, app_version, server_version
+               FROM clusters ORDER BY ts DESC LIMIT 200`;
+      params = [];
+    }
+    const result = await db.query(query, params);
+    res.json({ success: true, clusters: result.rows.map(r => ({
+      id: r.id, ts: r.ts, clusterName: r.cluster_name, synopsis: r.synopsis,
+      dominantEntity: r.dominant_entity, connectionType: r.connection_type,
+      frame: r.frame, event: r.event, postIds: r.post_ids,
+      isolatedPostIds: r.isolated_post_ids || [],
+      postSummaries: r.post_summaries || [],
+      connections: r.connections || [],
+      posts: r.posts || [],
+      postCount: r.post_count,
+      source: r.source, deviceId: r.device_id, appVersion: r.app_version, serverVersion: r.server_version
+    }))});
+  } catch(err) {
+    console.error('clusters/list error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// PATCH /clusters/rename
+// ─────────────────────────────────────────────
+app.patch('/clusters/rename', async (req, res) => {
+  const { clusterId, clusterName } = req.body;
+  if (!clusterId) return res.status(400).json({ error: 'clusterId required' });
+  if (!db) return res.json({ success: true, warning: 'DB not available' });
+  try {
+    await db.query(`UPDATE clusters SET cluster_name=$1 WHERE id=$2`, [clusterName||'', clusterId]);
+    res.json({ success: true });
+  } catch(err) {
+    console.error('clusters/rename error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /faq/list
+// ─────────────────────────────────────────────
+app.get('/faq/list', async (req, res) => {
+  if (!db) return res.json({ success: true, faqs: [] });
+  try {
+    const result = await db.query(
+      `SELECT id, question, answer, faq_group, sort_order, active FROM faq WHERE active=TRUE ORDER BY faq_group, sort_order, id`
+    );
+    res.json({ success: true, faqs: result.rows.map(r => ({
+      id: r.id, question: r.question, answer: r.answer,
+      group: r.faq_group, sortOrder: r.sort_order, active: r.active
+    }))});
+  } catch(err) {
+    console.error('faq/list error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// POST /faq/save  (add or update)
+// ─────────────────────────────────────────────
+app.post('/faq/save', async (req, res) => {
+  const { id, question, answer, group, sortOrder } = req.body;
+  if (!question || !answer) return res.status(400).json({ error: 'question and answer required' });
+  if (!db) return res.json({ success: true, warning: 'DB not available' });
+  try {
+    let result;
+    if (id) {
+      result = await db.query(
+        `UPDATE faq SET question=$1, answer=$2, faq_group=$3, sort_order=$4 WHERE id=$5 RETURNING id`,
+        [question, answer, group||'General', sortOrder||0, id]
+      );
+    } else {
+      result = await db.query(
+        `INSERT INTO faq (question, answer, faq_group, sort_order) VALUES ($1,$2,$3,$4) RETURNING id`,
+        [question, answer, group||'General', sortOrder||0]
+      );
+    }
+    res.json({ success: true, id: result.rows[0]?.id });
+  } catch(err) {
+    console.error('faq/save error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// DELETE /faq/:id
+// ─────────────────────────────────────────────
+app.delete('/faq/:id', async (req, res) => {
+  const { id } = req.params;
+  if (!db) return res.json({ success: true, warning: 'DB not available' });
+  try {
+    await db.query(`UPDATE faq SET active=FALSE WHERE id=$1`, [id]);
+    res.json({ success: true });
+  } catch(err) {
+    console.error('faq/delete error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ─────────────────────────────────────────────
 // HEALTH CHECK
@@ -194,11 +514,12 @@ app.post('/fetch-post', async (req, res) => {
   if (!url) return res.status(400).json({ error: 'url is required' });
   try {
     const platform = detectPlatform(url);
-    if (!platform) return res.status(400).json({ error: 'Unsupported URL. Paste a URL from X, Facebook, Instagram, or a supported news website.' });
+    if (!platform) return res.status(400).json({ error: 'Unsupported URL. Paste a URL from X, Facebook, Instagram, YouTube, or a supported news website.' });
     let result;
     if (platform === 'x') result = await fetchFromX(url);
     else if (platform === 'facebook') result = await fetchFromFacebook(url);
     else if (platform === 'instagram') result = await fetchFromInstagram(url);
+    else if (platform === 'youtube') result = await fetchFromYoutube(url);
     else if (platform === 'news') result = await fetchFromNews(url);
     res.json({ success: true, platform, ...result });
   } catch (err) {
@@ -234,14 +555,15 @@ app.post('/fetch-and-analyze', async (req, res) => {
   if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
   try {
     const platform = detectPlatform(url);
-    if (!platform) return res.status(400).json({ error: 'Unsupported URL. Paste a URL from X, Facebook, Instagram, or a supported news website.' });
+    if (!platform) return res.status(400).json({ error: 'Unsupported URL. Paste a URL from X, Facebook, Instagram, YouTube, or a supported news website.' });
     let postData;
     if (platform === 'x') postData = await fetchFromX(url);
     else if (platform === 'facebook') postData = await fetchFromFacebook(url);
     else if (platform === 'instagram') postData = await fetchFromInstagram(url);
+    else if (platform === 'youtube') postData = await fetchFromYoutube(url);
     else if (platform === 'news') postData = await fetchFromNews(url);
     if (!postData.text) return res.status(422).json({ error: 'Could not extract text. The content may be private, paywalled, or the platform may be blocking access.' });
-    const minLen = platform === 'news' ? 50 : 100;
+    const minLen = (platform === 'news' || platform === 'youtube') ? 50 : 100;
     if (postData.text.length < minLen) return res.status(422).json({ error: `Fetched text is too short (${postData.text.length} chars). Please paste the article text manually.` });
     const analysis = await scoreWithClaude(postData.text, entities);
     const responseUrl = postData.normalizedUrl || url;
@@ -524,6 +846,196 @@ app.patch('/history/comment', async (req, res) => {
   }
 });
 
+// POST /investigate/detect
+// ─────────────────────────────────────────────
+// Stage 1: for each pair of posts in the batch, detect whether a meaningful
+// connection exists. Returns connection graph — only pairs that pass threshold.
+app.post('/investigate/detect', async (req, res) => {
+  const { posts } = req.body;
+  if (!posts || posts.length < 2) return res.status(400).json({ error: 'At least 2 posts required' });
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured' });
+  try {
+    // Build all pairs
+    const pairs = [];
+    for (let i = 0; i < posts.length; i++) {
+      for (let j = i + 1; j < posts.length; j++) {
+        pairs.push([posts[i], posts[j]]);
+      }
+    }
+
+    // Optimization 1: batch pairs — 4 pairs per Claude call instead of 1
+    // Optimization 2: use Haiku for detection (pattern matching, not deep synthesis)
+    // Optimization 3: trim prompts — lead with structured data, short text excerpt only
+    const BATCH_SIZE = 4;
+    const allResults = [];
+
+    // Safe string: remove unpaired surrogates and non-printable chars
+    const safe = (s, max) => {
+      if (!s) return '';
+      return Buffer.from(String(s).replace(/[\uD800-\uDFFF]/g, ''), 'utf8')
+        .toString('utf8')
+        .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+        .slice(0, max || 200)
+        .replace(/\n/g, ' ')
+        .trim();
+    };
+
+    for (let b = 0; b < pairs.length; b += BATCH_SIZE) {
+      const batch = pairs.slice(b, b + BATCH_SIZE);
+
+      const pairsText = batch.map(([a, bPost], idx) => {
+        const aDate = a.ts ? new Date(a.ts).toISOString().slice(0,10) : '?';
+        const bDate = bPost.ts ? new Date(bPost.ts).toISOString().slice(0,10) : '?';
+        const aExcerpt = safe(a.postText, 150);
+        const bExcerpt = safe(bPost.postText, 150);
+        const aAlign = safe((a.topMatches||[]).slice(0,2).join('+') || 'none', 80);
+        const bAlign = safe((bPost.topMatches||[]).slice(0,2).join('+') || 'none', 80);
+        return `PAIR ${idx+1}:\nA: [${aDate}] alignment=${aAlign} (${a.overallScore||0}%) | "${aExcerpt}"\nB: [${bDate}] alignment=${bAlign} (${bPost.overallScore||0}%) | "${bExcerpt}"`;
+      }).join('\n\n');
+
+      const prompt = `You are a narrative analyst for Who's Behind That?, focused on the Israeli-Palestinian conflict and Israeli domestic politics.
+
+For each pair below, decide if there is a meaningful NARRATIVE CONNECTION — same framing goal, coordination signal, narrative escalation, or explicit reference. Not just topical overlap.
+
+${pairsText}
+
+Respond ONLY with a JSON array, one object per pair, in order:
+[
+  {
+    "pair": 1,
+    "connected": true/false,
+    "connectionType": "narrative reinforcement"|"coordination signal"|"narrative escalation"|"explicit reference"|null,
+    "strength": "strong"|"medium"|"weak"|null,
+    "reasoning": "one sentence"
+  }
+]`;
+
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 800,
+          temperature: 0,
+          messages: [{ role: 'user', content: prompt }]
+        })
+      });
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}));
+        console.error('Haiku API error:', response.status, JSON.stringify(errBody));
+        throw new Error(`API error ${response.status}: ${errBody.error?.message || 'unknown'}`);
+      }
+      const data = await response.json();
+      const raw = data.content.filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
+      if (!raw) throw new Error('Empty response from API');
+      let batchResults;
+      try {
+        batchResults = extractJSON(raw);
+      } catch(parseErr) {
+        console.error('JSON parse error, raw response:', raw.slice(0, 500));
+        throw new Error('Failed to parse API response: ' + parseErr.message);
+      }
+      const totalTokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
+
+      // Map batch results back to their pairs
+      batch.forEach(([a, bPost], idx) => {
+        const r = Array.isArray(batchResults) ? batchResults[idx] : batchResults;
+        allResults.push({
+          postA: a.scanId,
+          postB: bPost.scanId,
+          connected: r?.connected || false,
+          connectionType: r?.connectionType || null,
+          strength: r?.strength || null,
+          reasoning: r?.reasoning || '',
+          _tokens: totalTokens
+        });
+      });
+    }
+
+    const connections = allResults.filter(r => r.connected);
+
+    // Build clusters using union-find
+    const postIds = posts.map(p => p.scanId);
+    const parent = {};
+    postIds.forEach(id => { parent[id] = id; });
+    function find(x) { return parent[x] === x ? x : (parent[x] = find(parent[x])); }
+    function union(x, y) { parent[find(x)] = find(y); }
+    connections.forEach(c => union(c.postA, c.postB));
+
+    const clusterMap = {};
+    postIds.forEach(id => {
+      const root = find(id);
+      if (!clusterMap[root]) clusterMap[root] = [];
+      clusterMap[root].push(id);
+    });
+
+    const clusters = Object.values(clusterMap).filter(c => c.length > 1);
+    const isolated = postIds.filter(id => !clusters.flat().includes(id));
+
+    res.json({ success: true, connections, clusters, isolated });
+  } catch(err) {
+    console.error('investigate/detect error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /investigate/synthesize
+// ─────────────────────────────────────────────
+// Stage 2: for each cluster of connected posts, generate a synopsis + cluster name.
+app.post('/investigate/synthesize', async (req, res) => {
+  const { cluster, posts } = req.body;
+  if (!cluster || !posts || posts.length < 2) return res.status(400).json({ error: 'cluster array and posts array required' });
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured' });
+  try {
+    const clusterPosts = posts.filter(p => cluster.includes(p.scanId));
+    const safe3 = (s, max) => {
+      if (!s) return '';
+      return Buffer.from(String(s).replace(/[\uD800-\uDFFF]/g, ''), 'utf8')
+        .toString('utf8').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+        .slice(0, max || 300).replace(/\n/g, ' ').trim();
+    };
+    const postsText = clusterPosts.map((p, i) => {
+      const date = p.ts ? new Date(p.ts).toISOString().slice(0,10) : '?';
+      const excerpt = safe3(p.postText, 300);
+      const alignment = safe3((p.topMatches||[]).slice(0,2).join('+') || 'none', 80);
+      return `POST ${i+1} [${date}] alignment=${alignment} (${p.overallScore||0}%): "${excerpt}"`;
+    }).join('\n\n');
+
+    const prompt = `Narrative analyst for Who's Behind That? (Israeli-Palestinian conflict / Israeli politics).
+
+These ${clusterPosts.length} posts share narrative connections. Synthesize them.
+
+${postsText}
+
+Respond ONLY with valid JSON:
+{
+  "clusterName": "3-6 word name: [topic framing] · [entity]",
+  "synopsis": "2-4 sentences: what narrative is constructed, what pattern emerges, whose interests served",
+  "dominantEntity": "entity name",
+  "connectionType": "narrative reinforcement"|"coordination signal"|"narrative escalation"|"explicit reference",
+  "frame": "overarching frame/arc",
+  "event": "specific event or null",
+  "postSummaries": ["one sentence narrative summary for POST 1", "one sentence for POST 2", ...]
+}`;
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 900, temperature: 0, messages: [{ role: 'user', content: prompt }] })
+    });
+    if (!response.ok) throw new Error(`API error: ${response.status}`);
+    const data = await response.json();
+    const raw = data.content.filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
+    const result = extractJSON(raw);
+    result.postIds = cluster;
+    result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
+    res.json({ success: true, synthesis: result });
+  } catch(err) {
+    console.error('investigate/synthesize error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─────────────────────────────────────────────
 // POST /convergent-interest
 // Given post text + primary matches, finds hidden
@@ -617,8 +1129,64 @@ function detectPlatform(url) {
   if (/x\.com|twitter\.com/i.test(url)) return 'x';
   if (/facebook\.com|fb\.com/i.test(url)) return 'facebook';
   if (/instagram\.com/i.test(url)) return 'instagram';
+  if (/youtube\.com|youtu\.be/i.test(url)) return 'youtube';
   if (isNewsDomain(url)) return 'news';
   return null;
+}
+
+// ─────────────────────────────────────────────
+// YOUTUBE HELPERS
+// ─────────────────────────────────────────────
+function extractYoutubeId(url) {
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/v\/)([a-zA-Z0-9_-]{11})/,
+    /youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})/
+  ];
+  for (const p of patterns) {
+    const m = url.match(p);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+function extractEmbeddedYoutubeIds(html) {
+  const ids = new Set();
+  const patterns = [
+    /(?:youtube\.com\/embed\/|youtu\.be\/|youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/g,
+    /data-video-id="([a-zA-Z0-9_-]{11})"/g,
+    /"videoId":"([a-zA-Z0-9_-]{11})"/g
+  ];
+  for (const p of patterns) {
+    let m;
+    while ((m = p.exec(html)) !== null) ids.add(m[1]);
+  }
+  return [...ids];
+}
+
+async function fetchYoutubeTranscript(videoId) {
+  if (!TRANSCRIPT_API_KEY) { console.log('No TRANSCRIPT_API_KEY set'); return null; }
+  try {
+    const res = await fetch(`https://transcriptapi.com/api/v2/youtube/transcript?video_url=${videoId}&format=json&include_timestamp=false`, {
+      headers: { 'Authorization': `Bearer ${TRANSCRIPT_API_KEY}` }
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.log('TranscriptAPI failed:', res.status, errText);
+      return null;
+    }
+    const data = await res.json();
+    const segments = data.transcript || data.segments || [];
+    if (!segments.length) { console.log('TranscriptAPI: no segments for', videoId); return null; }
+    const text = segments.map(function(s){ return s.text || ''; }).join(' ').replace(/\s+/g, ' ').trim();
+    if (text.length < 50) { console.log('TranscriptAPI: transcript too short for', videoId); return null; }
+    const words = text.split(' ');
+    const result = words.length > 3000 ? words.slice(0, 3000).join(' ') + '...' : text;
+    console.log(`TranscriptAPI: fetched transcript for ${videoId}, ${words.length} words`);
+    return result;
+  } catch(e) {
+    console.log('TranscriptAPI error for', videoId, ':', e.message);
+    return null;
+  }
 }
 
 async function fetchFromNews(url) {
@@ -658,11 +1226,100 @@ async function fetchFromNews(url) {
                      $('[itemprop="author"]').first().text() || null;
       if (!text || text.length < 50) { lastError = new Error('Could not extract article text'); continue; }
       const fullText = title ? `${title}\n\n${text}` : text;
+
+      // Look for embedded YouTube videos and fetch their transcripts
+      const embeddedIds = extractEmbeddedYoutubeIds(html);
+      let videoNote = '';
+      if (embeddedIds.length > 0) {
+        const transcripts = [];
+        for (const vid of embeddedIds.slice(0, 5)) { // max 5 videos
+          const t = await fetchYoutubeTranscript(vid);
+          if (t) transcripts.push(t);
+        }
+        if (transcripts.length > 0) {
+          const combined = transcripts.join('\n\n');
+          const words = combined.split(' ');
+          const trimmed = words.length > 3000 ? words.slice(0, 3000).join(' ') + '...' : combined;
+          console.log(`News fetch: appended ${transcripts.length} YouTube transcript(s) from ${domain}`);
+          return { text: fullText + '\n\n' + trimmed, author: author ? author.trim() : null, authorHandle: author ? author.trim() : null, source: 'news', domain, hasVideoTranscript: true };
+        } else {
+          // Videos found but no transcripts available
+          videoNote = 'Note: this article contains embedded video(s) whose transcript could not be retrieved. Analysis is based on article text only.';
+        }
+      }
+
       console.log(`News fetch success from ${domain}, text length: ${fullText.length}`);
-      return { text: fullText, author: author ? author.trim() : null, authorHandle: author ? author.trim() : null, source: 'news', domain };
+      return { text: fullText, author: author ? author.trim() : null, authorHandle: author ? author.trim() : null, source: 'news', domain, videoNote: videoNote || null };
     } catch(e) { lastError = e; }
   }
   throw new Error(`Could not fetch article from ${domain}. ${lastError?.message || ''}. The article may be paywalled or require login.`);
+}
+
+// In-memory transcript cache — transcripts don't change once a video is published
+const transcriptCache = new Map();
+
+async function checkVideoMeta(videoId) {
+  if (!YOUTUBE_API_KEY) return null;
+  try {
+    const metaUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,liveStreamingDetails&id=${videoId}&key=${YOUTUBE_API_KEY}`;
+    const metaRes = await fetch(metaUrl);
+    if (!metaRes.ok) return null;
+    const metaData = await metaRes.json();
+    const item = (metaData.items || [])[0];
+    if (!item) return null;
+    const liveBroadcastContent = item.snippet?.liveBroadcastContent;
+    if (liveBroadcastContent === 'live') {
+      return { error: 'This video is currently live streaming. Live videos cannot be scanned — please try again after the stream ends.' };
+    }
+    const duration = item.contentDetails?.duration || '';
+    const durationMatch = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+    if (durationMatch) {
+      const hours = parseInt(durationMatch[1] || 0);
+      const minutes = parseInt(durationMatch[2] || 0);
+      if (hours > 0 || hours * 60 + minutes > 10) {
+        return { error: `This video is ${hours > 0 ? hours + 'h ' : ''}${minutes}m long. Who's Behind That? only supports videos up to 10 minutes. Please paste the relevant transcript manually instead.` };
+      }
+    }
+    return { ok: true };
+  } catch(e) { return null; }
+}
+
+async function fetchFromYoutube(url) {
+  const videoId = extractYoutubeId(url);
+  if (!videoId) throw new Error('Could not extract YouTube video ID from URL.');
+
+  // Run meta check and transcript fetch in parallel
+  const [meta, transcript] = await Promise.all([
+    checkVideoMeta(videoId),
+    transcriptCache.has(videoId)
+      ? Promise.resolve(transcriptCache.get(videoId))
+      : fetchYoutubeTranscript(videoId)
+  ]);
+
+  // Meta check gate — if video is live or too long, reject
+  if (meta && meta.error) throw new Error(meta.error);
+
+  if (!transcript) throw new Error('No transcript available for this YouTube video. You can paste the video text manually instead.');
+
+  // Cache the transcript
+  if (!transcriptCache.has(videoId)) {
+    transcriptCache.set(videoId, transcript);
+    // Limit cache size to 100 entries
+    if (transcriptCache.size > 100) {
+      const firstKey = transcriptCache.keys().next().value;
+      transcriptCache.delete(firstKey);
+    }
+  }
+
+  // Get title via oEmbed (run alongside cache store — no await needed before returning)
+  let title = '';
+  try {
+    const oe = await fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`);
+    if (oe.ok) { const d = await oe.json(); title = d.title || ''; }
+  } catch(e) {}
+  const fullText = title ? `${title}\n\n${transcript}` : transcript;
+  console.log(`YouTube: fetched for ${videoId}, length: ${fullText.length}, cached: ${transcriptCache.has(videoId)}`);
+  return { text: fullText, author: null, authorHandle: null, source: 'youtube', domain: 'youtube.com' };
 }
 
 // ─────────────────────────────────────────────
@@ -1374,11 +2031,15 @@ Respond ONLY with valid JSON:
 function extractJSON(text) {
   // Strip markdown fences
   let s = text.replace(/```json|```/g, '').trim();
-  // Find first { and last } to handle preamble/postamble text
-  const start = s.indexOf('{');
-  const end = s.lastIndexOf('}');
-  if (start !== -1 && end !== -1 && end > start) {
-    s = s.slice(start, end + 1);
+  // Handle arrays starting with [
+  const arrStart = s.indexOf('[');
+  const objStart = s.indexOf('{');
+  if (arrStart !== -1 && (objStart === -1 || arrStart < objStart)) {
+    const end = s.lastIndexOf(']');
+    if (end !== -1) s = s.slice(arrStart, end + 1);
+  } else if (objStart !== -1) {
+    const end = s.lastIndexOf('}');
+    if (end !== -1) s = s.slice(objStart, end + 1);
   }
   return JSON.parse(s);
 }
