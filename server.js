@@ -9,7 +9,13 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.4 — bug fix: promptCache referenced getModel() during initialization
+// v1.22.5 — bug fix: DB prompts had template variables (${postText} etc)
+//            sent as literal strings. Added interpolatePrompt() helper that
+//            resolves all ${var} placeholders before sending to Claude.
+//            Affects all 6 prompts: scan, coherence, connection, synopsis,
+//            actor, convergent.
+//
+// v1.22.4 — bug fix: promptCache ReferenceError on startup.
 //            causing ReferenceError on startup. Fixed by using plain string
 //            defaults in promptCache object literal.
 //
@@ -194,7 +200,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.4';
+const SERVER_VERSION = '1.22.5';
 
 import express from 'express';
 import cors from 'cors';
@@ -247,6 +253,14 @@ async function loadPromptsFromDB() {
     });
     console.log('Prompts loaded from DB:', result.rows.length);
   } catch(e) { console.warn('Could not load prompts from DB:', e.message); }
+}
+
+function interpolatePrompt(template, vars) {
+  return template.replace(/\$\{(\w+(?:\.\w+)*)\}/g, function(match, key) {
+    // Handle simple keys like postText, pairsText, etc.
+    const val = vars[key];
+    return val !== undefined ? val : match;
+  });
 }
 
 function getPrompt(name) {
@@ -1123,10 +1137,10 @@ Respond ONLY with a JSON array, one object per pair, in order:
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
         body: JSON.stringify({
-          model: 'claude-haiku-4-5-20251001',
+          model: getModel('connection'),
           max_tokens: 800,
           temperature: 0,
-          messages: [{ role: 'user', content: prompt }]
+          messages: [{ role: 'user', content: getPrompt('connection') ? interpolatePrompt(getPrompt('connection'), {pairsText}) : prompt }]
         })
       });
       if (!response.ok) {
@@ -1230,7 +1244,9 @@ Respond ONLY with valid JSON:
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: getModel('synopsis'), max_tokens: 900, temperature: 0, messages: [{ role: 'user', content: getPrompt('synopsis') || prompt }] })
+      const dbPrompt = getPrompt('synopsis');
+      const finalPrompt = dbPrompt ? interpolatePrompt(dbPrompt, { postsText, 'clusterPosts.length': clusterPosts.length }) : prompt;
+      body: JSON.stringify({ model: getModel('synopsis'), max_tokens: 900, temperature: 0, messages: [{ role: 'user', content: finalPrompt }] })
     });
     if (!response.ok) throw new Error(`API error: ${response.status}`);
     const data = await response.json();
@@ -1321,7 +1337,7 @@ Or: { "found": false }`;
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: getModel('convergent'), max_tokens: 600, temperature: 0, messages: [{ role: 'user', content: getPrompt('convergent') || prompt }] })
+    body: JSON.stringify({ model: getModel('convergent'), max_tokens: 600, temperature: 0, messages: [{ role: 'user', content: getPrompt('convergent') ? interpolatePrompt(getPrompt('convergent'), {postText, primaryNames, entitySummaries}) : prompt }] })
   });
   if (!response.ok) { const err = await response.json().catch(()=>({})); throw new Error('Claude API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
@@ -1905,7 +1921,7 @@ Respond ONLY with valid JSON — the filtered list of matches to KEEP:
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: getModel('coherence'), max_tokens: 1500, temperature: 0, messages: [{ role: 'user', content: getPrompt('coherence') || prompt }] })
+    body: JSON.stringify({ model: getModel('coherence'), max_tokens: 1500, temperature: 0, messages: [{ role: 'user', content: getPrompt('coherence') ? interpolatePrompt(getPrompt('coherence'), {postText, candidateSummary}) : prompt }] })
   });
   if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error('Coherence check API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
@@ -2042,7 +2058,7 @@ Respond ONLY with valid JSON, no preamble, no markdown:
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: getModel('scan'), max_tokens: 2000, temperature: 0, messages: [{ role: 'user', content: getPrompt('scan') || prompt }] })
+    body: JSON.stringify({ model: getModel('scan'), max_tokens: 2000, temperature: 0, messages: [{ role: 'user', content: getPrompt('scan') ? interpolatePrompt(getPrompt('scan'), {postText, entitySummaries}) : prompt }] })
   });
   if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error('Claude API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
