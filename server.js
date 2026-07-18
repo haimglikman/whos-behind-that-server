@@ -9,7 +9,10 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.5 — bug fix: DB prompts had template variables (${postText} etc)
+// v1.22.6 — bug fix: SyntaxError — const declarations were inside fetch()
+//            object literal. Moved before the fetch call.
+//
+// v1.22.5 — bug fix: DB prompts template variables sent as literal strings.
 //            sent as literal strings. Added interpolatePrompt() helper that
 //            resolves all ${var} placeholders before sending to Claude.
 //            Affects all 6 prompts: scan, coherence, connection, synopsis,
@@ -200,7 +203,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.5';
+const SERVER_VERSION = '1.22.6';
 
 import express from 'express';
 import cors from 'cors';
@@ -256,10 +259,9 @@ async function loadPromptsFromDB() {
 }
 
 function interpolatePrompt(template, vars) {
-  return template.replace(/\$\{(\w+(?:\.\w+)*)\}/g, function(match, key) {
-    // Handle simple keys like postText, pairsText, etc.
+  return template.replace(/\$\{([^}]+)\}/g, function(match, key) {
     const val = vars[key];
-    return val !== undefined ? val : match;
+    return val !== undefined ? String(val) : match;
   });
 }
 
@@ -1241,12 +1243,12 @@ Respond ONLY with valid JSON:
   "postSummaries": ["one sentence narrative summary for POST 1", "one sentence for POST 2", ...]
 }`;
 
+    const dbSynopsisPrompt = getPrompt('synopsis');
+    const finalSynopsisPrompt = dbSynopsisPrompt ? interpolatePrompt(dbSynopsisPrompt, { postsText, 'clusterPosts.length': String(clusterPosts.length) }) : prompt;
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-      const dbPrompt = getPrompt('synopsis');
-      const finalPrompt = dbPrompt ? interpolatePrompt(dbPrompt, { postsText, 'clusterPosts.length': clusterPosts.length }) : prompt;
-      body: JSON.stringify({ model: getModel('synopsis'), max_tokens: 900, temperature: 0, messages: [{ role: 'user', content: finalPrompt }] })
+      body: JSON.stringify({ model: getModel('synopsis'), max_tokens: 900, temperature: 0, messages: [{ role: 'user', content: finalSynopsisPrompt }] })
     });
     if (!response.ok) throw new Error(`API error: ${response.status}`);
     const data = await response.json();
