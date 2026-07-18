@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.5 — bug fix (server) | Admin: v2.16.0 | Client: v1.17.2
+- Fixed DB prompts sending template variables as literal strings (${postText}, ${postsText} etc) — added interpolatePrompt() helper that resolves all placeholders before sending to Claude
+- Applies to all 6 prompts: scan, coherence, connection, synopsis, actor, convergent
+
 ### v1.22.4 — bug fix (server) | Admin: v2.15.0
 - Fixed ReferenceError on startup: promptCache was calling getModel() during its own initialization
 
