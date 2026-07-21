@@ -9,7 +9,11 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.6 — bug fix: SyntaxError — const declarations were inside fetch()
+// v1.22.7 — Client session tracking: new client_sessions table,
+//            POST /client/register (called on client page load),
+//            GET /client/sessions (returns all known versions with device count).
+//
+// v1.22.6 — bug fix: SyntaxError in synopsis prompt interpolation.
 //            object literal. Moved before the fetch call.
 //
 // v1.22.5 — bug fix: DB prompts template variables sent as literal strings.
@@ -203,7 +207,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.6';
+const SERVER_VERSION = '1.22.7';
 
 import express from 'express';
 import cors from 'cors';
@@ -404,6 +408,12 @@ async function initDB() {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_by TEXT DEFAULT 'admin',
         version TEXT DEFAULT '1.0.0'
+      );
+      CREATE TABLE IF NOT EXISTS client_sessions (
+        device_id TEXT PRIMARY KEY,
+        client_version TEXT NOT NULL,
+        last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
     // Seed default FAQs if table is empty
@@ -716,6 +726,43 @@ app.post('/prompts/activate/:id', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// ─────────────────────────────────────────────
+// POST /client/register
+// ─────────────────────────────────────────────
+app.post('/client/register', async (req, res) => {
+  const { deviceId, clientVersion } = req.body;
+  if (!deviceId || !clientVersion) return res.json({ success: false });
+  if (!db) return res.json({ success: true, warning: 'DB not available' });
+  try {
+    await db.query(
+      `INSERT INTO client_sessions (device_id, client_version, last_seen, first_seen)
+       VALUES ($1, $2, NOW(), NOW())
+       ON CONFLICT (device_id) DO UPDATE SET client_version=$2, last_seen=NOW()`,
+      [deviceId, clientVersion]
+    );
+    res.json({ success: true });
+  } catch(err) {
+    console.error('client/register error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /client/sessions
+// ─────────────────────────────────────────────
+app.get('/client/sessions', async (req, res) => {
+  if (!db) return res.json({ success: false, error: 'DB not available' });
+  try {
+    const result = await db.query(
+      `SELECT client_version, COUNT(*) as device_count, MAX(last_seen) as last_seen, MIN(first_seen) as first_seen
+       FROM client_sessions GROUP BY client_version ORDER BY client_version DESC`
+    );
+    res.json({ success: true, sessions: result.rows });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: "Who's Behind That? API", version: SERVER_VERSION, db: !!db });
 });
