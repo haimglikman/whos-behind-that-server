@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.7 (server) | Admin: v2.16.2 | Client: v1.17.3
+- New client_sessions table — tracks device ID, client version, first/last seen
+- POST /client/register — called by client on page load to register its version
+- GET /client/sessions — returns all known client versions with device count and last seen date
+
 ### v1.22.6 — bug fix (server) | Admin: v2.16.0 | Client: v1.17.2
 - Fixed SyntaxError: const declarations were placed inside fetch() object literal — moved before the fetch call
 
