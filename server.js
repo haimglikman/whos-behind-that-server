@@ -9,7 +9,14 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.7 — Client session tracking: new client_sessions table,
+// v1.22.8 — Three-tier news article fetching:
+//            Tier 1: basic headers (existing approach, 3 user agents).
+//            Tier 2: full browser-like headers (sec-ch-ua, Sec-Fetch-*, Referer
+//            google.com) to bypass aggressive anti-bot measures.
+//            Tier 3: Archive.org fallback for blocked/paywalled articles.
+//            extractArticle() and enrichWithYoutube() extracted as helpers.
+//
+// v1.22.7 — Client session tracking.
 //            POST /client/register (called on client page load),
 //            GET /client/sessions (returns all known versions with device count).
 //
@@ -207,7 +214,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.7';
+const SERVER_VERSION = '1.22.8';
 
 import express from 'express';
 import cors from 'cors';
@@ -1465,68 +1472,131 @@ async function fetchYoutubeTranscript(videoId) {
 
 async function fetchFromNews(url) {
   const domain = extractDomain(url);
-  const userAgents = [
+
+  // Helper: extract article text from HTML
+  function extractArticle(html, url) {
+    const $ = cheerio.load(html);
+    const articleSelectors = [
+      'article p', '.article-body p', '.story-body p',
+      '[itemprop="articleBody"] p', '.content-area p',
+      '.article-content p', '.post-content p', '.entry-content p',
+      '.articleBody p', '#article-body p', '.body-copy p'
+    ];
+    let text = '';
+    for (const sel of articleSelectors) {
+      const paragraphs = $(sel).map((i, el) => $(el).text().trim()).get().filter(t => t.length > 50);
+      if (paragraphs.length > 0) { text = paragraphs.slice(0, 15).join(' '); break; }
+    }
+    if (!text || text.length < 100) {
+      text = $('meta[property="og:description"]').attr('content') ||
+             $('meta[name="description"]').attr('content') ||
+             $('meta[property="og:title"]').attr('content') || '';
+    }
+    const title = $('meta[property="og:title"]').attr('content') || $('title').text() || '';
+    const author = $('meta[name="author"]').attr('content') ||
+                   $('[rel="author"]').first().text() ||
+                   $('[itemprop="author"]').first().text() || null;
+    return { text, title, author };
+  }
+
+  // Tier 1: Basic headers (current approach)
+  const basicUserAgents = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Googlebot/2.1 (+http://www.google.com/bot.html)',
     'Mozilla/5.0 (compatible; Bingbot/2.0; +http://www.bing.com/bingbot.htm)'
   ];
-  let lastError;
-  for (const ua of userAgents) {
+
+  for (const ua of basicUserAgents) {
     try {
       const response = await fetch(url, {
-        headers: { 'User-Agent': ua, 'Accept': 'text/html,application/xhtml+xml', 'Accept-Language': 'en-US,en;q=0.9,he;q=0.8' },
+        headers: { 'User-Agent': ua, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9,he;q=0.8' },
         redirect: 'follow'
       });
-      if (!response.ok) { lastError = new Error(`HTTP ${response.status}`); continue; }
+      if (!response.ok) continue;
       const html = await response.text();
-      const $ = cheerio.load(html);
-      // Try to get article body first, fall back to meta tags
-      const articleSelectors = ['article p', '.article-body p', '.story-body p', '[itemprop="articleBody"] p', '.content-area p'];
-      let text = '';
-      for (const sel of articleSelectors) {
-        const paragraphs = $(sel).map((i, el) => $(el).text().trim()).get().filter(t => t.length > 50);
-        if (paragraphs.length > 0) { text = paragraphs.slice(0, 10).join(' '); break; }
-      }
-      // Fall back to meta tags if no article body found
-      if (!text || text.length < 100) {
-        text = $('meta[property="og:description"]').attr('content') ||
-               $('meta[name="description"]').attr('content') ||
-               $('meta[property="og:title"]').attr('content') || '';
-      }
-      const title = $('meta[property="og:title"]').attr('content') || $('title').text() || '';
-      // Get author if available
-      const author = $('meta[name="author"]').attr('content') ||
-                     $('[rel="author"]').first().text() ||
-                     $('[itemprop="author"]').first().text() || null;
-      if (!text || text.length < 50) { lastError = new Error('Could not extract article text'); continue; }
+      const { text, title, author } = extractArticle(html, url);
+      if (!text || text.length < 100) continue;
       const fullText = title ? `${title}\n\n${text}` : text;
-
-      // Look for embedded YouTube videos and fetch their transcripts
-      const embeddedIds = extractEmbeddedYoutubeIds(html);
-      let videoNote = '';
-      if (embeddedIds.length > 0) {
-        const transcripts = [];
-        for (const vid of embeddedIds.slice(0, 5)) { // max 5 videos
-          const t = await fetchYoutubeTranscript(vid);
-          if (t) transcripts.push(t);
-        }
-        if (transcripts.length > 0) {
-          const combined = transcripts.join('\n\n');
-          const words = combined.split(' ');
-          const trimmed = words.length > 3000 ? words.slice(0, 3000).join(' ') + '...' : combined;
-          console.log(`News fetch: appended ${transcripts.length} YouTube transcript(s) from ${domain}`);
-          return { text: fullText + '\n\n' + trimmed, author: author ? author.trim() : null, authorHandle: author ? author.trim() : null, source: 'news', domain, hasVideoTranscript: true };
-        } else {
-          // Videos found but no transcripts available
-          videoNote = 'Note: this article contains embedded video(s) whose transcript could not be retrieved. Analysis is based on article text only.';
-        }
-      }
-
-      console.log(`News fetch success from ${domain}, text length: ${fullText.length}`);
-      return { text: fullText, author: author ? author.trim() : null, authorHandle: author ? author.trim() : null, source: 'news', domain, videoNote: videoNote || null };
-    } catch(e) { lastError = e; }
+      console.log(`News fetch (tier 1) success from ${domain}, length: ${fullText.length}`);
+      return await enrichWithYoutube(html, fullText, author, domain);
+    } catch(e) { /* try next */ }
   }
-  throw new Error(`Could not fetch article from ${domain}. ${lastError?.message || ''}. The article may be paywalled or require login.`);
+
+  // Tier 2: Full browser-like headers
+  console.log(`News fetch tier 1 failed for ${domain}, trying full browser headers`);
+  const browserHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9,he;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1',
+    'sec-ch-ua': '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'Referer': 'https://www.google.com/'
+  };
+
+  try {
+    const response = await fetch(url, { headers: browserHeaders, redirect: 'follow' });
+    if (response.ok) {
+      const html = await response.text();
+      const { text, title, author } = extractArticle(html, url);
+      if (text && text.length >= 100) {
+        const fullText = title ? `${title}\n\n${text}` : text;
+        console.log(`News fetch (tier 2) success from ${domain}, length: ${fullText.length}`);
+        return await enrichWithYoutube(html, fullText, author, domain);
+      }
+    }
+  } catch(e) { /* fall through to tier 3 */ }
+
+  // Tier 3: Archive.org fallback
+  console.log(`News fetch tier 2 failed for ${domain}, trying Archive.org`);
+  try {
+    const archiveUrl = `https://web.archive.org/web/2/${url}`;
+    const response = await fetch(archiveUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36', 'Accept': 'text/html' },
+      redirect: 'follow'
+    });
+    if (response.ok) {
+      const html = await response.text();
+      const { text, title, author } = extractArticle(html, url);
+      if (text && text.length >= 100) {
+        const fullText = title ? `${title}\n\n${text}` : text;
+        console.log(`News fetch (tier 3 archive.org) success from ${domain}, length: ${fullText.length}`);
+        return await enrichWithYoutube(html, fullText, author, domain);
+      }
+    }
+  } catch(e) { /* fall through */ }
+
+  throw new Error(`Could not fetch article from ${domain}. The article may be paywalled, require login, or not yet indexed. You can paste the article text manually below.`);
+}
+
+async function enrichWithYoutube(html, fullText, author, domain) {
+  const embeddedIds = extractEmbeddedYoutubeIds(html);
+  let videoNote = '';
+  if (embeddedIds.length > 0) {
+    const transcripts = [];
+    for (const vid of embeddedIds.slice(0, 5)) {
+      const t = await fetchYoutubeTranscript(vid);
+      if (t) transcripts.push(t);
+    }
+    if (transcripts.length > 0) {
+      const combined = transcripts.join('\n\n');
+      const words = combined.split(' ');
+      const trimmed = words.length > 3000 ? words.slice(0, 3000).join(' ') + '...' : combined;
+      console.log(`News fetch: appended ${transcripts.length} YouTube transcript(s) from ${domain}`);
+      return { text: fullText + '\n\n' + trimmed, author: author ? author.trim() : null, authorHandle: author ? author.trim() : null, source: 'news', domain, hasVideoTranscript: true };
+    } else {
+      videoNote = 'Note: this article contains embedded video(s) whose transcript could not be retrieved. Analysis is based on article text only.';
+    }
+  }
+  return { text: fullText, author: author ? author.trim() : null, authorHandle: author ? author.trim() : null, source: 'news', domain, videoNote: videoNote || null };
 }
 
 // In-memory transcript cache — transcripts don't change once a video is published
