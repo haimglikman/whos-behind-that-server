@@ -9,7 +9,10 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.9 — Added error logging to all three news fetch tier catch blocks.
+// v1.22.10 — Added missing news domains: nypost.com, c14.co.il, and many others
+//             that were returning "Unsupported URL" instead of attempting fetch.
+//
+// v1.22.9 — Added error logging to news fetch tiers.
 //
 // v1.22.8 — Three-tier news article fetching.
 //            Tier 1: basic headers (existing approach, 3 user agents).
@@ -216,7 +219,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.9';
+const SERVER_VERSION = '1.22.10';
 
 import express from 'express';
 import cors from 'cors';
@@ -2215,6 +2218,14 @@ const NEWS_DOMAINS = new Set([
   'i24news.tv','jewishinsider.com','tabletmag.com','mosaic.org','commentary.org',
   'debka.com','debkafile.com','memri.org','jihadwatch.org',
   'axios.com','vox.com','vice.com','buzzfeednews.com','huffpost.com',
+  'nypost.com','dailybeast.com','thedailybeast.com','breitbart.com','theintercept.com',
+  'spectator.co.uk','spectator.us','nationalreview.com','weeklystandard.com',
+  'thenation.com','motherjones.com','slate.com','salon.com','theatlantic.com',
+  // Israeli — additional
+  'c14.co.il','14tv.co.il','mida.org.il','makor-rishon.co.il','makorrishon.co.il',
+  'srugim.co.il','kipa.co.il','hidabroot.com','arutz7.co.il','behadrei.co.il',
+  'kikar.co.il','bhol.co.il','ladaat.co.il','col.org.il','chadrei-charedim.com',
+  'mynet.co.il','one.co.il','nrg.co.il','sport1.co.il','keshet12.co.il',
 ]);
 
 function isNewsDomain(url) {
