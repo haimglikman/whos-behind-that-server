@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.9 — debug (server) | Admin: v2.17.11 | Client: v1.17.8
+- Added error logging to all three news fetch tier catch blocks — failures now visible in Render logs
+
 ### v1.22.8 (server) | Admin: v2.17.11 | Client: v1.17.8
 - Three-tier news article fetching:
   - Tier 1: basic headers with 3 user agents (existing approach)
