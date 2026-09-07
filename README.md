@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.10 (server) | Admin: v2.17.11 | Client: v1.17.8
+- Added missing news domains to NEWS_DOMAINS: nypost.com, c14.co.il, and ~20 others (Israeli and international) that were incorrectly returning "Unsupported URL"
+
 ### v1.22.9 — debug (server) | Admin: v2.17.11 | Client: v1.17.8
 - Added error logging to all three news fetch tier catch blocks — failures now visible in Render logs
 
