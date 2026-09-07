@@ -9,7 +9,12 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.10 — Added missing news domains: nypost.com, c14.co.il, and many others
+// v1.22.11 — Smart URL detection: any URL with a non-root path now attempts
+//             news fetching (3-tier) instead of returning "Unsupported URL".
+//             NEWS_DOMAINS whitelist still used for fast-path detection but
+//             no longer the only way to trigger news fetch.
+//
+// v1.22.10 — Added missing news domains.
 //             that were returning "Unsupported URL" instead of attempting fetch.
 //
 // v1.22.9 — Added error logging to news fetch tiers.
@@ -219,7 +224,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.10';
+const SERVER_VERSION = '1.22.11';
 
 import express from 'express';
 import cors from 'cors';
@@ -1417,6 +1422,13 @@ function detectPlatform(url) {
   if (/instagram\.com/i.test(url)) return 'instagram';
   if (/youtube\.com|youtu\.be/i.test(url)) return 'youtube';
   if (isNewsDomain(url)) return 'news';
+  // Fall back to news for any URL with an article-like path (not just a homepage)
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname;
+    // Looks like an article if path has at least 2 segments or contains numbers/words
+    if (path && path.length > 1 && path !== '/') return 'news';
+  } catch(e) {}
   return null;
 }
 
