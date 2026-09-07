@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.11 (server) | Admin: v2.17.11 | Client: v1.17.8
+- Smart URL detection: any URL with a non-root path now attempts news fetching (3-tier) instead of "Unsupported URL" — no more missing domains
+- NEWS_DOMAINS whitelist kept for fast-path detection but no longer the gatekeeper
+
 ### v1.22.10 (server) | Admin: v2.17.11 | Client: v1.17.8
 - Added missing news domains to NEWS_DOMAINS: nypost.com, c14.co.il, and ~20 others (Israeli and international) that were incorrectly returning "Unsupported URL"
 
