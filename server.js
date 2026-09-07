@@ -9,7 +9,9 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.8 — Three-tier news article fetching:
+// v1.22.9 — Added error logging to all three news fetch tier catch blocks.
+//
+// v1.22.8 — Three-tier news article fetching.
 //            Tier 1: basic headers (existing approach, 3 user agents).
 //            Tier 2: full browser-like headers (sec-ch-ua, Sec-Fetch-*, Referer
 //            google.com) to bypass aggressive anti-bot measures.
@@ -214,7 +216,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.8';
+const SERVER_VERSION = '1.22.9';
 
 import express from 'express';
 import cors from 'cors';
@@ -1519,7 +1521,7 @@ async function fetchFromNews(url) {
       const fullText = title ? `${title}\n\n${text}` : text;
       console.log(`News fetch (tier 1) success from ${domain}, length: ${fullText.length}`);
       return await enrichWithYoutube(html, fullText, author, domain);
-    } catch(e) { /* try next */ }
+    } catch(e) { console.log(`News fetch tier 1 error (${ua.slice(0,20)}):`, e.message); }
   }
 
   // Tier 2: Full browser-like headers
@@ -1553,7 +1555,7 @@ async function fetchFromNews(url) {
         return await enrichWithYoutube(html, fullText, author, domain);
       }
     }
-  } catch(e) { /* fall through to tier 3 */ }
+  } catch(e) { console.log(`News fetch tier 2 error for ${domain}:`, e.message); }
 
   // Tier 3: Archive.org fallback
   console.log(`News fetch tier 2 failed for ${domain}, trying Archive.org`);
@@ -1572,7 +1574,7 @@ async function fetchFromNews(url) {
         return await enrichWithYoutube(html, fullText, author, domain);
       }
     }
-  } catch(e) { /* fall through */ }
+  } catch(e) { console.log(`News fetch tier 3 error for ${domain}:`, e.message); }
 
   throw new Error(`Could not fetch article from ${domain}. The article may be paywalled, require login, or not yet indexed. You can paste the article text manually below.`);
 }
