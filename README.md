@@ -1,5 +1,12 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.8 (server) | Admin: v2.17.11 | Client: v1.17.8
+- Three-tier news article fetching:
+  - Tier 1: basic headers with 3 user agents (existing approach)
+  - Tier 2: full browser-like headers (sec-ch-ua, Sec-Fetch-*, Referer: google.com) to bypass aggressive anti-bot measures like NY Post
+  - Tier 3: Archive.org fallback for articles that block direct access entirely
+- Better error message when all tiers fail, suggesting manual paste
+
 ### v1.22.7 (server) | Admin: v2.16.2 | Client: v1.17.3
 - New client_sessions table — tracks device ID, client version, first/last seen
 - POST /client/register — called by client on page load to register its version
