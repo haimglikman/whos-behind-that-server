@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.13 (server) | Admin: v2.17.11 | Client: v1.17.8
+- extractJSON: 4th attempt — char-by-char quote repair for unescaped quotes inside Hebrew/Arabic JSON strings
+- Added raw response snippet to all JSON parse failure logs
+
 ### v1.22.12 (server) | Admin: v2.17.11 | Client: v1.17.8
 - Hardened extractJSON with 3-attempt parsing: (1) as-is, (2) control character sanitization, (3) regex field extraction fallback — fixes "Unexpected non-whitespace character" errors on Hebrew/Arabic content
 
