@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.16 — debug (server) | Admin: v2.17.11 | Client: v1.17.8
+- Added stop_reason and raw response length to scoreBatch parse error logs — needed to diagnose truncation cause
+
 ### v1.22.15 (server) | Admin: v2.17.11 | Client: v1.17.8
 - Increased scan max_tokens 2000→4000 and coherence max_tokens 1500→2500 — prevents truncated JSON when entity database is large (62 entities were exceeding the 2000 token limit)
 
