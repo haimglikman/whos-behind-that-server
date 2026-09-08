@@ -9,7 +9,12 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.11 — Smart URL detection: any URL with a non-root path now attempts
+// v1.22.12 — Hardened extractJSON: 3-attempt parsing — as-is, then control
+//             char sanitization, then regex field extraction fallback.
+//             Fixes "Unexpected non-whitespace character" errors on Hebrew/Arabic
+//             content with embedded newlines or special chars in JSON strings.
+//
+// v1.22.11 — Smart URL detection.
 //             news fetching (3-tier) instead of returning "Unsupported URL".
 //             NEWS_DOMAINS whitelist still used for fast-path detection but
 //             no longer the only way to trigger news fetch.
@@ -224,7 +229,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.11';
+const SERVER_VERSION = '1.22.12';
 
 import express from 'express';
 import cors from 'cors';
@@ -2410,7 +2415,36 @@ function extractJSON(text) {
     const end = s.lastIndexOf('}');
     if (end !== -1) s = s.slice(objStart, end + 1);
   }
-  return JSON.parse(s);
+  // First attempt: parse as-is
+  try { return JSON.parse(s); } catch(e) {}
+  // Second attempt: fix common issues — unescaped newlines and control chars inside strings
+  try {
+    const fixed = s.replace(/[\u0000-\u001F\u007F]/g, function(ch) {
+      const map = {'\n':'\\n','\r':'\\r','\t':'\\t','\b':'\\b','\f':'\\f'};
+      return map[ch] || '';
+    });
+    return JSON.parse(fixed);
+  } catch(e) {}
+  // Third attempt: use a regex to extract key fields individually
+  const result = {};
+  const patterns = [
+    ['topMatches', /\"topMatches\"\s*:\s*(\[[^\]]*\])/],
+    ['overallScore', /\"overallScore\"\s*:\s*(\d+(?:\.\d+)?)/],
+    ['overallLabel', /\"overallLabel\"\s*:\s*\"([^\"]+)\"/],
+    ['confidence', /\"confidence\"\s*:\s*\"([^\"]+)\"/],
+    ['reasoning', /\"reasoning\"\s*:\s*\"((?:[^\"\\]|\\.)*)\"/],
+    ['connectionType', /\"connectionType\"\s*:\s*\"([^\"]+)\"/],
+    ['connected', /\"connected\"\s*:\s*(true|false)/],
+    ['strength', /\"strength\"\s*:\s*\"([^\"]+)\"/],
+  ];
+  patterns.forEach(function([key, rx]) {
+    const m = s.match(rx);
+    if (m) {
+      try { result[key] = JSON.parse(m[1]); } catch(e) { result[key] = m[1]; }
+    }
+  });
+  if (Object.keys(result).length > 0) return result;
+  throw new Error('Could not parse JSON from Claude response');
 }
 function stripHtml(html) { return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); }
 
