@@ -9,7 +9,9 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.16 — Added stop_reason and raw length logging to scoreBatch parse errors.
+// v1.22.17 — Rewrote extractJSON with proper string-aware repair.
+//
+// v1.22.16 — Added stop_reason logging.
 //
 // v1.22.15 — Increased max_tokens for scan and coherence.
 //             to prevent truncated JSON responses when entity database is large.
@@ -242,7 +244,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.16';
+const SERVER_VERSION = '1.22.17';
 
 import express from 'express';
 import cors from 'cors';
@@ -2428,7 +2430,7 @@ Respond ONLY with valid JSON:
 function extractJSON(text) {
   // Strip markdown fences
   let s = text.replace(/```json|```/g, '').trim();
-  // Handle arrays starting with [
+  // Extract JSON object/array boundaries
   const arrStart = s.indexOf('[');
   const objStart = s.indexOf('{');
   if (arrStart !== -1 && (objStart === -1 || arrStart < objStart)) {
@@ -2442,64 +2444,78 @@ function extractJSON(text) {
   // Attempt 1: parse as-is
   try { return JSON.parse(s); } catch(e) {}
 
-  // Attempt 2: sanitize control characters
+  // Attempt 2: robust string-aware repair
+  // Walk the JSON character by character, tracking string context,
+  // and fix unescaped quotes, newlines, and other control chars inside strings
   try {
-    const fixed = s.replace(/[\u0000-\u001F\u007F]/g, function(ch) {
-      const map = {'\n':'\\n','\r':'\\r','\t':'\\t','\b':'\\b','\f':'\\f'};
-      return map[ch] || '';
-    });
-    return JSON.parse(fixed);
-  } catch(e) {}
-
-  // Attempt 3: repair unescaped quotes inside JSON string values
-  // Parse character by character to properly escape unescaped quotes inside strings
-  try {
-    let result = '';
-    let inString = false;
-    let escaped = false;
+    let out = '';
+    let inStr = false;
+    let esc = false;
     for (let i = 0; i < s.length; i++) {
-      const ch = s[i];
-      if (escaped) { result += ch; escaped = false; continue; }
-      if (ch === '\\') { result += ch; escaped = true; continue; }
-      if (ch === '"') {
-        if (!inString) { inString = true; result += ch; continue; }
-        // Check if this closes the string: next non-space should be :, ,, }, ]
+      const c = s[i];
+      if (esc) { out += c; esc = false; continue; }
+      if (c === '\\') { out += c; esc = true; continue; }
+      if (!inStr) {
+        if (c === '"') { inStr = true; out += c; continue; }
+        out += c; continue;
+      }
+      // Inside a string
+      if (c === '"') {
+        // Peek ahead to decide: closing quote or unescaped internal quote?
         let j = i + 1;
-        while (j < s.length && s[j] === ' ') j++;
-        const next = s[j];
-        if (next === ':' || next === ',' || next === '}' || next === ']' || j >= s.length) {
-          inString = false; result += ch;
+        while (j < s.length && (s[j] === ' ' || s[j] === '\t')) j++;
+        const nxt = s[j];
+        if (nxt === ':' || nxt === ',' || nxt === '}' || nxt === ']' || j >= s.length) {
+          inStr = false; out += c;
         } else {
-          // Unescaped quote inside string — escape it
-          result += '\\"';
+          out += '\\"'; // escape internal quote
         }
         continue;
       }
-      if (inString && (ch === '\n' || ch === '\r')) { result += '\\n'; continue; }
-      result += ch;
+      if (c === '\n') { out += '\\n'; continue; }
+      if (c === '\r') { out += '\\r'; continue; }
+      if (c === '\t') { out += '\\t'; continue; }
+      // Other control chars — strip
+      if (c.charCodeAt(0) < 0x20) continue;
+      out += c;
     }
-    return JSON.parse(result);
+    return JSON.parse(out);
   } catch(e) {}
 
-  // Attempt 4: regex field extraction fallback
+  // Attempt 3: strip all problematic chars from string values using regex
+  try {
+    const cleaned = s.replace(/"((?:[^"\\\n]|\\.)*)"/g, function(match, inner) {
+      // Re-escape newlines and strip other control chars inside string values
+      const fixed = inner
+        .replace(/\n/g, '\\n')
+        .replace(/\r/g, '')
+        .replace(/[\x00-\x1f]/g, '');
+      return '"' + fixed + '"';
+    });
+    return JSON.parse(cleaned);
+  } catch(e) {}
+
+  // Attempt 4: field extraction for critical fields
   const out = {};
-  const patterns = [
-    ['topMatches', /\"topMatches\"\s*:\s*(\[[^\]]*\])/],
-    ['overallScore', /\"overallScore\"\s*:\s*(\d+(?:\.\d+)?)/],
-    ['overallLabel', /\"overallLabel\"\s*:\s*\"([^\"]+)\"/],
-    ['confidence', /\"confidence\"\s*:\s*\"([^\"]+)\"/],
-    ['reasoning', /\"reasoning\"\s*:\s*\"((?:[^\"\\]|\\.)*)\"/],
-    ['connectionType', /\"connectionType\"\s*:\s*\"([^\"]+)\"/],
-    ['connected', /\"connected\"\s*:\s*(true|false)/],
-    ['strength', /\"strength\"\s*:\s*\"([^\"]+)\"/],
-  ];
-  patterns.forEach(function([key, rx]) {
-    const m = s.match(rx);
-    if (m) { try { out[key] = JSON.parse(m[1]); } catch(e) { out[key] = m[1]; } }
+  [
+    ['text_ai_score', /"text_ai_score"\s*:\s*(\d+)/],
+    ['text_ai_reason', /"text_ai_reason"\s*:\s*"((?:[^"\\]|\\.)*)"/],
+    ['connected', /"connected"\s*:\s*(true|false)/],
+    ['connectionType', /"connectionType"\s*:\s*"([^"]+)"/],
+    ['strength', /"strength"\s*:\s*"([^"]+)"/],
+    ['overallScore', /"overallScore"\s*:\s*(\d+)/],
+    ['overallLabel', /"overallLabel"\s*:\s*"([^"]+)"/],
+  ].forEach(function(pair) {
+    const m = s.match(pair[1]);
+    if (m) { try { out[pair[0]] = JSON.parse(m[1]); } catch(e2) { out[pair[0]] = m[1]; } }
   });
+  // Extract matches array if present
+  const matchesM = s.match(/"matches"\s*:\s*(\[[\s\S]*?\](?=\s*[,}]))/);
+  if (matchesM) { try { out.matches = JSON.parse(matchesM[1]); } catch(e) {} }
   if (Object.keys(out).length > 0) return out;
   throw new Error('Could not parse JSON from Claude response');
 }
+
 function stripHtml(html) { return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); }
 
 // ─────────────────────────────────────────────
