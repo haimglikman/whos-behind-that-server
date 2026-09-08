@@ -9,7 +9,11 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.12 — Hardened extractJSON: 3-attempt parsing — as-is, then control
+// v1.22.13 — Improved extractJSON: 4-attempt parsing including char-by-char
+//             quote repair for unescaped quotes inside Hebrew/Arabic strings.
+//             Added raw response logging on all parse failures.
+//
+// v1.22.12 — Hardened extractJSON.
 //             char sanitization, then regex field extraction fallback.
 //             Fixes "Unexpected non-whitespace character" errors on Hebrew/Arabic
 //             content with embedded newlines or special chars in JSON strings.
@@ -229,7 +233,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.12';
+const SERVER_VERSION = '1.22.13';
 
 import express from 'express';
 import cors from 'cors';
@@ -951,7 +955,7 @@ Respond ONLY with valid JSON:
         result.entityName = entity.name;
         return result;
       } catch(parseErr) {
-        console.warn(`JSON parse failed for ${entity.name}:`, parseErr.message);
+        console.warn(`JSON parse failed for ${entity.name}:`, parseErr.message, '| raw:', raw.slice(0, 300));
         return { changed: false, entityId: entity.id, entityName: entity.name, error: 'Parse error', _tokens: { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 } };
       }
     }));
@@ -2415,9 +2419,11 @@ function extractJSON(text) {
     const end = s.lastIndexOf('}');
     if (end !== -1) s = s.slice(objStart, end + 1);
   }
-  // First attempt: parse as-is
+
+  // Attempt 1: parse as-is
   try { return JSON.parse(s); } catch(e) {}
-  // Second attempt: fix common issues — unescaped newlines and control chars inside strings
+
+  // Attempt 2: sanitize control characters
   try {
     const fixed = s.replace(/[\u0000-\u001F\u007F]/g, function(ch) {
       const map = {'\n':'\\n','\r':'\\r','\t':'\\t','\b':'\\b','\f':'\\f'};
@@ -2425,8 +2431,39 @@ function extractJSON(text) {
     });
     return JSON.parse(fixed);
   } catch(e) {}
-  // Third attempt: use a regex to extract key fields individually
-  const result = {};
+
+  // Attempt 3: repair unescaped quotes inside JSON string values
+  // Parse character by character to properly escape unescaped quotes inside strings
+  try {
+    let result = '';
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (escaped) { result += ch; escaped = false; continue; }
+      if (ch === '\\') { result += ch; escaped = true; continue; }
+      if (ch === '"') {
+        if (!inString) { inString = true; result += ch; continue; }
+        // Check if this closes the string: next non-space should be :, ,, }, ]
+        let j = i + 1;
+        while (j < s.length && s[j] === ' ') j++;
+        const next = s[j];
+        if (next === ':' || next === ',' || next === '}' || next === ']' || j >= s.length) {
+          inString = false; result += ch;
+        } else {
+          // Unescaped quote inside string — escape it
+          result += '\\"';
+        }
+        continue;
+      }
+      if (inString && (ch === '\n' || ch === '\r')) { result += '\\n'; continue; }
+      result += ch;
+    }
+    return JSON.parse(result);
+  } catch(e) {}
+
+  // Attempt 4: regex field extraction fallback
+  const out = {};
   const patterns = [
     ['topMatches', /\"topMatches\"\s*:\s*(\[[^\]]*\])/],
     ['overallScore', /\"overallScore\"\s*:\s*(\d+(?:\.\d+)?)/],
@@ -2439,11 +2476,9 @@ function extractJSON(text) {
   ];
   patterns.forEach(function([key, rx]) {
     const m = s.match(rx);
-    if (m) {
-      try { result[key] = JSON.parse(m[1]); } catch(e) { result[key] = m[1]; }
-    }
+    if (m) { try { out[key] = JSON.parse(m[1]); } catch(e) { out[key] = m[1]; } }
   });
-  if (Object.keys(result).length > 0) return result;
+  if (Object.keys(out).length > 0) return out;
   throw new Error('Could not parse JSON from Claude response');
 }
 function stripHtml(html) { return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); }
