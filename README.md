@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.17 (server) | Admin: v2.17.11 | Client: v1.17.8
+- Rewrote extractJSON with proper string-aware JSON repair — walks character by character tracking string context, correctly fixes unescaped quotes, newlines and control characters inside Hebrew/Arabic string values. Adds regex-based cleanup as 3rd attempt. Should reliably handle all Claude JSON responses.
+
 ### v1.22.16 — debug (server) | Admin: v2.17.11 | Client: v1.17.8
 - Added stop_reason and raw response length to scoreBatch parse error logs — needed to diagnose truncation cause
 
