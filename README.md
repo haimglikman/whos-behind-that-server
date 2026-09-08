@@ -1,5 +1,12 @@
 # Who's Behind That? — Server Changelog
 
+### v1.23.0 (server) | Admin: v2.17.11 | Client: v1.17.8
+- New two-phase scoring architecture to permanently fix Hebrew/Arabic JSON parse errors:
+  - Phase 1: Claude returns numbers only (id, scores, pct, alignment) — no text fields, no Hebrew/Arabic characters in JSON values — eliminates parse errors entirely
+  - Phase 2: separate enrichment call for why/missing fields, explicitly English-only output — clean JSON guaranteed
+  - Phase 2 failure is non-fatal — scores and alignment remain valid even if explanations fail
+- Social media posts and English content completely unaffected
+
 ### v1.22.17 (server) | Admin: v2.17.11 | Client: v1.17.8
 - Rewrote extractJSON with proper string-aware JSON repair — walks character by character tracking string context, correctly fixes unescaped quotes, newlines and control characters inside Hebrew/Arabic string values. Adds regex-based cleanup as 3rd attempt. Should reliably handle all Claude JSON responses.
 
