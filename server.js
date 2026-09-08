@@ -9,7 +9,9 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.15 — Increased max_tokens for scan (2000→4000) and coherence (1500→2500)
+// v1.22.16 — Added stop_reason and raw length logging to scoreBatch parse errors.
+//
+// v1.22.15 — Increased max_tokens for scan and coherence.
 //             to prevent truncated JSON responses when entity database is large.
 //
 // v1.22.14 — Fixed JSON parsing in coherenceCheck and scoreBatch.
@@ -240,7 +242,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.15';
+const SERVER_VERSION = '1.22.16';
 
 import express from 'express';
 import cors from 'cors';
@@ -2224,7 +2226,7 @@ Respond ONLY with valid JSON, no preamble, no markdown:
   try {
     result = extractJSON(raw);
   } catch(e) {
-    console.error('scoreBatch JSON parse error:', e.message, '| raw:', raw.slice(0, 500));
+    console.error('scoreBatch JSON parse error:', e.message, '| stop_reason:', data.stop_reason, '| raw length:', raw.length, '| raw end:', raw.slice(-200));
     throw e;
   }
   result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
