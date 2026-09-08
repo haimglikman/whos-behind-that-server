@@ -9,7 +9,14 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.17 — Rewrote extractJSON with proper string-aware repair.
+// v1.23.0 — New two-phase scoring architecture:
+//             Phase 1: numbers-only JSON (no text fields, no Hebrew/Arabic
+//             in JSON values) — eliminates JSON parse errors on Hebrew content.
+//             Phase 2: separate enrichment call for why/missing fields,
+//             explicitly English-only output.
+//             Phase 2 failure is non-fatal — scores remain valid.
+//
+// v1.22.17 — Rewrote extractJSON.
 //
 // v1.22.16 — Added stop_reason logging.
 //
@@ -244,7 +251,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.17';
+const SERVER_VERSION = '1.23.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -2106,120 +2113,55 @@ function formatEntityCompact(e) {
 async function scoreBatch(postText, entities) {
   const entitySummaries = entities.map(formatEntityCompact).join('\n---\n');
 
-  const prompt = `You are a senior analyst specializing in geopolitical influence operations, information warfare, and social media manipulation. Your task is to determine whose agenda a social media post serves, and what context it leaves out.
+  // PHASE 1: Numbers only — no text fields, no Hebrew/Arabic in JSON values
+  const phase1Prompt = `You are a senior analyst specializing in geopolitical influence operations and social media manipulation.
 
 LANGUAGE NOTE:
-The post may be written in English, Hebrew, or Arabic. Score based on semantic meaning and political intent regardless of the language. Do not penalize non-English posts. Key political vocabulary to recognize:
-- Hebrew: ביביזם (Bibiism/blind Netanyahu loyalty), פלישה (invasion/encroachment), ריבונות (sovereignty), יהודה ושומרון (Judea and Samaria/West Bank), אכיפה (enforcement), מאחז (outpost), עסקת חטופים (hostage deal), מחאה (protest)
-- Arabic: مقاومة (resistance), شهيد (martyr), الاحتلال (the occupation), النضال (the struggle), محور المقاومة (Axis of Resistance), التطبيع (normalization), الاستيطان (settlement)
+The post may be in English, Hebrew, or Arabic. Score based on semantic meaning and political intent.
+Hebrew markers: ביביזם, פלישה, ריבונות, יהודה ושומרון, עסקת חטופים, מחאה
+Arabic markers: مقاومة, شهيد, الاحتلال, النضال, محور المقاومة, التطبيع
 
 CORE PHILOSOPHY:
-The primary concern is not whether a post contains outright lies, but whether it tells only half the story to serve a specific agenda. A post can be factually accurate and still be pure propaganda if it selectively presents only the facts that serve one side. Identify: (1) whose hidden interest this post serves directly, (2) who indirectly benefits from the post being spread, and (3) what relevant context is conspicuously absent.
+Identify whose agenda this post serves — not whether it is true, but who benefits from its spread.
 
-SOCIAL MEDIA POST TEXT:
+POST TEXT:
 "${postText}"
 
-ENTITY DATABASE (score ALL of these — do not skip any):
-Field key: N=narrative (public stance), I=interest (hidden strategic interest), M=modus operandi (known tactics), C=comments
+ENTITY DATABASE (score ALL):
+Field key: N=narrative, I=interest, M=modus operandi, C=comments
 ${entitySummaries}
 
 SCORING INSTRUCTIONS:
-For EACH entity above, assess three dimensions:
+For EACH entity score three dimensions (0-100):
+1. interest_score (weight 55%): Would spreading this post advance this entity's HIDDEN strategic interest?
+   - CONTENT angle: Does the post's message/framing directly serve this entity?
+   - CONTEXT angle: Does the post attack a documented rival of this entity? (Attack Entity A → rival Entity B scores high)
+2. mo_score (weight 35%): Does post construction match this entity's known manipulation tactics?
+3. narrative_score (weight 10%): Does post echo this entity's official public statements?
+combined_score = round(interest*0.55 + mo*0.35 + narrative*0.10)
 
-1. interest_score (0-100) — MOST IMPORTANT (weight: 55%)
-   "Would spreading this post advance this entity's HIDDEN strategic interest?"
-   Consider TWO angles — apply whichever is stronger, or combine if both are present:
-   a) CONTENT: Does the post's message, framing, or narrative directly serve this entity's interests?
-   b) CONTEXT: Does the post attack, undermine, or discredit someone this entity considers a rival or opponent?
-      ONLY apply context scoring if ALL three conditions are met:
-      - A specific named or unmistakably identifiable target is being attacked
-      - That attack is CENTRAL to the post (not incidental or passing)
-      - The rival relationship between that target and this entity is documented in the entity list above
-      If context scoring applies, weight it according to how explicit and central the attack is:
-      - Very direct, central attack on a named rival → strong context signal, weight heavily
-      - Implied or between-the-lines criticism → weaker signal, weight moderately
-      If context is the primary driver of the score, explain this clearly in the "why" field.
+RULES:
+- Criticism ≠ alignment. A post attacking Entity X does NOT align with Entity X.
+- Always complete the beneficiary chain: attack on A → A's rivals score high.
+- Rankings/preference lists: elevated entity scores high, dismissed entity scores low.
+- Max 3 primary matches, max 2 secondary. primary = direct beneficiary, secondary = indirect.
+- alignment field MANDATORY on every match with pct>=60.
 
-2. mo_score (0-100) — IMPORTANT (weight: 35%)
-   "Does the construction of this post match this entity's known manipulation playbook?"
+IMPORTANT: Return ONLY numbers and short identifiers. Do NOT include any explanatory text, sentences, or non-English characters in ANY field. The "why", "missing" fields must be empty strings.
 
-3. narrative_score (0-100) — WEAK SIGNAL (weight: 10%)
-   "Does the post's surface content echo this entity's official public statements?"
-
-Compute: combined_score = (interest_score * 0.55) + (mo_score * 0.35) + (narrative_score * 0.10)
-Round to nearest integer.
-
-IMPORTANT: Return ALL entities where combined_score >= 60.
-The frontend will apply the 85% threshold for display.
-
-PRIMARY vs SECONDARY ALIGNMENT:
-After scoring, classify each match (combined_score >= 60) as either:
-- "primary": This entity is a DIRECT beneficiary — the post appears to have been written with this entity's agenda in mind, consciously or not.
-- "secondary": This entity is an INDIRECT or COLLATERAL beneficiary — the post was not necessarily written for them, but its spread still serves their interests as a side effect.
-
-CRITICAL RULE — CRITICISM IS NOT ALIGNMENT:
-If a post ATTACKS, CRITICIZES, or DELEGITIMIZES an entity, that entity scores LOW on primary alignment — being criticized does not serve your interest. A post mocking Netanyahu does NOT align with Netanyahu. A post exposing Hamas atrocities does NOT align with Hamas. Only score an entity high if spreading the post HELPS them.
-
-CRITICAL RULE — COMPLETE THE BENEFICIARY CHAIN:
-When a post attacks Entity A, always ask: who benefits from Entity A being weakened or discredited? If Entity A's rival (Entity B) is documented in the entity list, Entity B scores HIGH — even if Entity B is never mentioned in the post. This is the most commonly missed signal.
-Examples:
-- Post attacks Bennett, Lapid, Golan → Netanyahu scores high (his rivals are being delegitimized)
-- Post attacks Netanyahu → Israeli opposition scores high
-- Post attacks PA/Abbas → Hamas scores high
-- Post attacks Hamas → PA/Abbas and Israel score high
-Apply this chain for EVERY named target in the post. Never stop at "target scores low" — always follow through to "therefore rival scores high."
-
-CRITICAL RULE — PREFERENCE LISTS AND RANKINGS:
-When a post ranks or compares entities ("I prefer X over Y", "X is 1000 times better than Y"), the entity being elevated scores HIGH, the entity being dismissed scores LOW. A post saying "Netanyahu 1 over 1,000,000,000 Bennett/Lapid/Golan" strongly serves Netanyahu's interest and attacks his rivals — do not be confused by the list format. Score the beneficiary of the glorification, not just the targets of criticism.
-
-CRITICAL RULE — SARCASM AND IRONY DETECTION:
-Assume literal intent UNLESS the post contains explicit irony markers:
-- Quotation marks around praise that reads as mockery
-- A punchline or final line that contradicts the surface meaning
-- Exaggerated praise that is internally inconsistent ("the greatest leader in all of history" style)
-- Hebrew irony markers: "כן בטח", "בטח שכן", "ברור", used sarcastically
-If none of these are present, score the post at face value. Do NOT second-guess straightforward political preference posts. The risk of misidentifying genuine support as sarcasm is greater than missing actual sarcasm.
-
-CRITICAL RULE — INTRA-COALITION CRITICISM:
-Entities in the same political coalition can still have distinct and sometimes conflicting interests. A post criticizing Netanyahu from the RIGHT (e.g. settlers or Ben Gvir demanding harder enforcement) does NOT align with Netanyahu — it aligns with the settler/nationalist bloc specifically. A post criticizing Netanyahu from the LEFT aligns with the Israeli opposition, not with Iran or Hamas even if they also oppose Netanyahu. Score each entity's specific interest independently, not by coalition membership alone.
-
-Maximum 3 primary matches, maximum 2 secondary matches. If a match qualifies for both, assign it to primary only.
-The "alignment" field is MANDATORY on every match — always set it to either "primary" or "secondary", never omit it or leave it blank.
-
-For each entity with combined_score >= 60, provide:
-- "alignment": "primary" or "secondary"
-- "why": 2-3 sentences — for primary: which hidden interest is directly served and which MO tactics are present; for secondary: how the post's spread indirectly benefits this entity
-- "missing": 2-3 sentences on what relevant context this post conspicuously omits
-
-For entities with combined_score < 60, still include them with scores but "why", "missing", and "alignment" can be empty strings.
-
-Also assess (only needed once — include in first batch response):
-- text_ai_score (1-10): probability the text was AI-generated
-- text_ai_reason: one sentence of evidence
-
-Respond ONLY with valid JSON, no preamble, no markdown:
+Respond ONLY with valid JSON, no markdown:
 {
   "text_ai_score": 5,
-  "text_ai_reason": "...",
+  "text_ai_reason": "one short English sentence only",
   "matches": [
-    {
-      "id": 2,
-      "name": "Hamas",
-      "narrative": 92,
-      "interest": 95,
-      "mo": 88,
-      "pct": 91,
-      "alignment": "primary",
-      "why": "...",
-      "missing": "..."
-    }
+    {"id": 2, "name": "Hamas", "narrative": 92, "interest": 95, "mo": 88, "pct": 91, "alignment": "primary", "why": "", "missing": ""}
   ]
 }`;
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: getModel('scan'), max_tokens: 4000, temperature: 0, messages: [{ role: 'user', content: getPrompt('scan') ? interpolatePrompt(getPrompt('scan'), {postText, entitySummaries}) : prompt }] })
+    body: JSON.stringify({ model: getModel('scan'), max_tokens: 3000, temperature: 0, messages: [{ role: 'user', content: getPrompt('scan') ? interpolatePrompt(getPrompt('scan'), {postText, entitySummaries}) : phase1Prompt }] })
   });
   if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error('Claude API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
@@ -2228,10 +2170,59 @@ Respond ONLY with valid JSON, no preamble, no markdown:
   try {
     result = extractJSON(raw);
   } catch(e) {
-    console.error('scoreBatch JSON parse error:', e.message, '| stop_reason:', data.stop_reason, '| raw length:', raw.length, '| raw end:', raw.slice(-200));
+    console.error('scoreBatch phase1 parse error:', e.message, '| stop_reason:', data.stop_reason, '| raw length:', raw.length);
     throw e;
   }
   result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
+
+  // PHASE 2: Enrich top matches with explanatory text — always in English
+  const topMatches = (result.matches || []).filter(m => m.pct >= 60);
+  if (topMatches.length > 0) {
+    const matchSummary = topMatches.map(m => `ID:${m.id} NAME:${m.name} SCORE:${m.pct}% ALIGNMENT:${m.alignment}`).join('\n');
+    const phase2Prompt = `A scoring engine has analyzed the following post and identified these entity matches.
+
+POST TEXT (may be in any language):
+"${postText}"
+
+MATCHED ENTITIES:
+${matchSummary}
+
+For each matched entity, write in ENGLISH ONLY:
+- why: 2-3 sentences on which hidden interest is directly served and which tactics are present
+- missing: 2-3 sentences on what relevant context this post conspicuously omits
+
+CRITICAL: Respond ONLY in English. Never include Hebrew, Arabic, or any non-Latin characters in your response.
+
+Respond ONLY with valid JSON, no markdown:
+[
+  {"id": 2, "why": "English explanation only.", "missing": "English explanation only."}
+]`;
+
+    try {
+      const r2 = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: getModel('scan'), max_tokens: 1500, temperature: 0, messages: [{ role: 'user', content: phase2Prompt }] })
+      });
+      if (r2.ok) {
+        const d2 = await r2.json();
+        const raw2 = d2.content.map(c => c.text || '').join('').trim();
+        const enrichments = extractJSON(raw2);
+        result._tokens.input += d2.usage?.input_tokens || 0;
+        result._tokens.output += d2.usage?.output_tokens || 0;
+        if (Array.isArray(enrichments)) {
+          enrichments.forEach(function(e) {
+            const match = (result.matches || []).find(m => m.id === e.id);
+            if (match) { match.why = e.why || ''; match.missing = e.missing || ''; }
+          });
+        }
+      }
+    } catch(e2) {
+      console.warn('scoreBatch phase2 enrichment failed (non-fatal):', e2.message);
+      // Phase 2 failure is non-fatal — scores still valid, just no explanations
+    }
+  }
+
   return result;
 }
 
