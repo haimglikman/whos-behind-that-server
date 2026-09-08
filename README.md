@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.15 (server) | Admin: v2.17.11 | Client: v1.17.8
+- Increased scan max_tokens 2000→4000 and coherence max_tokens 1500→2500 — prevents truncated JSON when entity database is large (62 entities were exceeding the 2000 token limit)
+
 ### v1.22.14 (server) | Admin: v2.17.11 | Client: v1.17.8
 - Fixed JSON parsing in coherenceCheck and scoreBatch — both used plain JSON.parse instead of extractJSON, causing parse failures on Hebrew/Arabic content with unescaped characters
 - Both now use extractJSON (4-attempt parsing) with raw response logging on failure
