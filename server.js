@@ -9,7 +9,11 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.13 — Improved extractJSON: 4-attempt parsing including char-by-char
+// v1.22.14 — Fixed JSON parsing in coherenceCheck and scoreBatch — both were
+//             using plain JSON.parse instead of extractJSON, causing failures
+//             on Hebrew/Arabic content. Now use extractJSON with raw logging.
+//
+// v1.22.13 — Improved extractJSON.
 //             quote repair for unescaped quotes inside Hebrew/Arabic strings.
 //             Added raw response logging on all parse failures.
 //
@@ -233,7 +237,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.13';
+const SERVER_VERSION = '1.22.14';
 
 import express from 'express';
 import cors from 'cors';
@@ -2071,8 +2075,13 @@ Respond ONLY with valid JSON — the filtered list of matches to KEEP:
   if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error('Coherence check API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
   const raw = data.content.map(c => c.text || '').join('').trim();
-  const clean = raw.replace(/```json|```/g, '').trim();
-  const result = JSON.parse(clean);
+  let result;
+  try {
+    result = extractJSON(raw);
+  } catch(e) {
+    console.error('Coherence check JSON parse error:', e.message, '| raw:', raw.slice(0, 500));
+    throw e;
+  }
   const matches = result.matches || [];
   matches._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
   return matches;
@@ -2208,8 +2217,13 @@ Respond ONLY with valid JSON, no preamble, no markdown:
   if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error('Claude API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
   const raw = data.content.map(c => c.text || '').join('').trim();
-  const clean = raw.replace(/```json|```/g, '').trim();
-  const result = JSON.parse(clean);
+  let result;
+  try {
+    result = extractJSON(raw);
+  } catch(e) {
+    console.error('scoreBatch JSON parse error:', e.message, '| raw:', raw.slice(0, 500));
+    throw e;
+  }
   result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
   return result;
 }
