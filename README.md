@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.14 (server) | Admin: v2.17.11 | Client: v1.17.8
+- Fixed JSON parsing in coherenceCheck and scoreBatch — both used plain JSON.parse instead of extractJSON, causing parse failures on Hebrew/Arabic content with unescaped characters
+- Both now use extractJSON (4-attempt parsing) with raw response logging on failure
+
 ### v1.22.13 (server) | Admin: v2.17.11 | Client: v1.17.8
 - extractJSON: 4th attempt — char-by-char quote repair for unescaped quotes inside Hebrew/Arabic JSON strings
 - Added raw response snippet to all JSON parse failure logs
