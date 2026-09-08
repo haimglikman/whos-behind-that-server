@@ -9,7 +9,10 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
-// v1.22.14 — Fixed JSON parsing in coherenceCheck and scoreBatch — both were
+// v1.22.15 — Increased max_tokens for scan (2000→4000) and coherence (1500→2500)
+//             to prevent truncated JSON responses when entity database is large.
+//
+// v1.22.14 — Fixed JSON parsing in coherenceCheck and scoreBatch.
 //             using plain JSON.parse instead of extractJSON, causing failures
 //             on Hebrew/Arabic content. Now use extractJSON with raw logging.
 //
@@ -237,7 +240,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.22.14';
+const SERVER_VERSION = '1.22.15';
 
 import express from 'express';
 import cors from 'cors';
@@ -2070,7 +2073,7 @@ Respond ONLY with valid JSON — the filtered list of matches to KEEP:
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: getModel('coherence'), max_tokens: 1500, temperature: 0, messages: [{ role: 'user', content: getPrompt('coherence') ? interpolatePrompt(getPrompt('coherence'), {postText, candidateSummary}) : prompt }] })
+    body: JSON.stringify({ model: getModel('coherence'), max_tokens: 2500, temperature: 0, messages: [{ role: 'user', content: getPrompt('coherence') ? interpolatePrompt(getPrompt('coherence'), {postText, candidateSummary}) : prompt }] })
   });
   if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error('Coherence check API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
@@ -2212,7 +2215,7 @@ Respond ONLY with valid JSON, no preamble, no markdown:
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: getModel('scan'), max_tokens: 2000, temperature: 0, messages: [{ role: 'user', content: getPrompt('scan') ? interpolatePrompt(getPrompt('scan'), {postText, entitySummaries}) : prompt }] })
+    body: JSON.stringify({ model: getModel('scan'), max_tokens: 4000, temperature: 0, messages: [{ role: 'user', content: getPrompt('scan') ? interpolatePrompt(getPrompt('scan'), {postText, entitySummaries}) : prompt }] })
   });
   if (!response.ok) { const err = await response.json().catch(() => ({})); throw new Error('Claude API error: ' + (err.error?.message || response.status)); }
   const data = await response.json();
