@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.22.12 (server) | Admin: v2.17.11 | Client: v1.17.8
+- Hardened extractJSON with 3-attempt parsing: (1) as-is, (2) control character sanitization, (3) regex field extraction fallback — fixes "Unexpected non-whitespace character" errors on Hebrew/Arabic content
+
 ### v1.22.11 (server) | Admin: v2.17.11 | Client: v1.17.8
 - Smart URL detection: any URL with a non-root path now attempts news fetching (3-tier) instead of "Unsupported URL" — no more missing domains
 - NEWS_DOMAINS whitelist kept for fast-path detection but no longer the gatekeeper
