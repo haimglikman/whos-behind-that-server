@@ -9,6 +9,10 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
+// v1.23.1 — Performance: Phase 2 enrichment now runs once for ALL top
+//             matches combined (was once per batch). Parallel batches already
+//             in place. Rate limit fallback: if 429, retries sequentially.
+//
 // v1.23.0 — New two-phase scoring architecture:
 //             Phase 1: numbers-only JSON (no text fields, no Hebrew/Arabic
 //             in JSON values) — eliminates JSON parse errors on Hebrew content.
@@ -251,7 +255,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.23.0';
+const SERVER_VERSION = '1.23.1';
 
 import express from 'express';
 import cors from 'cors';
@@ -1989,7 +1993,21 @@ async function scoreWithClaude(postText, entities) {
 
   const batches = [];
   for (let i = 0; i < entities.length; i += BATCH_SIZE) batches.push(entities.slice(i, i + BATCH_SIZE));
-  const batchResults = await Promise.all(batches.map(batch => scoreBatch(enrichedText, batch)));
+  // Run all batches in parallel — fallback to sequential if rate limited
+  let batchResults;
+  try {
+    batchResults = await Promise.all(batches.map(batch => scoreBatch(enrichedText, batch)));
+  } catch(e) {
+    if (e.message && e.message.includes('429')) {
+      console.warn('Rate limit hit on parallel batches, falling back to sequential');
+      batchResults = [];
+      for (const batch of batches) {
+        batchResults.push(await scoreBatch(enrichedText, batch));
+      }
+    } else {
+      throw e;
+    }
+  }
   const allMatches = [];
   let text_ai_score = 5, text_ai_reason = '';
   for (const result of batchResults) {
@@ -2002,6 +2020,11 @@ async function scoreWithClaude(postText, entities) {
     }
   }
   allMatches.sort((a, b) => b.pct - a.pct);
+
+  // Phase 2: single enrichment call for ALL top matches across all batches
+  const topMatches = allMatches.filter(m => m.pct >= 60);
+  const p2tokens = await enrichMatches(enrichedText, topMatches);
+  if (p2tokens) { totalInputTokens += p2tokens.input; totalOutputTokens += p2tokens.output; }
 
   const candidates = allMatches.filter(m => m.pct >= 60);
   let finalMatches = allMatches;
@@ -2175,11 +2198,13 @@ Respond ONLY with valid JSON, no markdown:
   }
   result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
 
-  // PHASE 2: Enrich top matches with explanatory text — always in English
-  const topMatches = (result.matches || []).filter(m => m.pct >= 60);
-  if (topMatches.length > 0) {
-    const matchSummary = topMatches.map(m => `ID:${m.id} NAME:${m.name} SCORE:${m.pct}% ALIGNMENT:${m.alignment}`).join('\n');
-    const phase2Prompt = `A scoring engine has analyzed the following post and identified these entity matches.
+  return result;
+}
+
+async function enrichMatches(postText, topMatches) {
+  if (!topMatches || topMatches.length === 0) return;
+  const matchSummary = topMatches.map(m => `ID:${m.id} NAME:${m.name} SCORE:${m.pct}% ALIGNMENT:${m.alignment}`).join('\n');
+  const phase2Prompt = `A scoring engine has analyzed the following post and identified these entity matches.
 
 POST TEXT (may be in any language):
 "${postText}"
@@ -2198,32 +2223,26 @@ Respond ONLY with valid JSON, no markdown:
   {"id": 2, "why": "English explanation only.", "missing": "English explanation only."}
 ]`;
 
-    try {
-      const r2 = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model: getModel('scan'), max_tokens: 1500, temperature: 0, messages: [{ role: 'user', content: phase2Prompt }] })
+  try {
+    const r2 = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: getModel('scan'), max_tokens: 1500, temperature: 0, messages: [{ role: 'user', content: phase2Prompt }] })
+    });
+    if (!r2.ok) return;
+    const d2 = await r2.json();
+    const raw2 = d2.content.map(c => c.text || '').join('').trim();
+    const enrichments = extractJSON(raw2);
+    if (Array.isArray(enrichments)) {
+      enrichments.forEach(function(e) {
+        const match = topMatches.find(m => m.id === e.id);
+        if (match) { match.why = e.why || ''; match.missing = e.missing || ''; }
       });
-      if (r2.ok) {
-        const d2 = await r2.json();
-        const raw2 = d2.content.map(c => c.text || '').join('').trim();
-        const enrichments = extractJSON(raw2);
-        result._tokens.input += d2.usage?.input_tokens || 0;
-        result._tokens.output += d2.usage?.output_tokens || 0;
-        if (Array.isArray(enrichments)) {
-          enrichments.forEach(function(e) {
-            const match = (result.matches || []).find(m => m.id === e.id);
-            if (match) { match.why = e.why || ''; match.missing = e.missing || ''; }
-          });
-        }
-      }
-    } catch(e2) {
-      console.warn('scoreBatch phase2 enrichment failed (non-fatal):', e2.message);
-      // Phase 2 failure is non-fatal — scores still valid, just no explanations
     }
+    return { input: d2.usage?.input_tokens || 0, output: d2.usage?.output_tokens || 0 };
+  } catch(e2) {
+    console.warn('Phase 2 enrichment failed (non-fatal):', e2.message);
   }
-
-  return result;
 }
 
 // ─────────────────────────────────────────────
