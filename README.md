@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v1.23.1 (server) | Admin: v2.17.11 | Client: v1.17.8
+- Performance: Phase 2 enrichment (why/missing) now runs once for all top matches combined instead of once per batch — eliminates redundant API calls
+- Parallel batch execution already in place (Promise.all) — confirmed working
+- Rate limit fallback: if parallel batches hit 429, automatically retries sequentially
+
 ### v1.23.0 (server) | Admin: v2.17.11 | Client: v1.17.8
 - New two-phase scoring architecture to permanently fix Hebrew/Arabic JSON parse errors:
   - Phase 1: Claude returns numbers only (id, scores, pct, alignment) — no text fields, no Hebrew/Arabic characters in JSON values — eliminates parse errors entirely
