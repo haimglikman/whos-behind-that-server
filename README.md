@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.23.2 (server) | Admin: v2.18.0 | Client: v1.17.8
+- fetchFromNews now extracts and returns og:image and og:title alongside article text and author
+
 ### v1.23.1 (server) | Admin: v2.17.11 | Client: v1.17.8
 - Performance: Phase 2 enrichment (why/missing) now runs once for all top matches combined instead of once per batch — eliminates redundant API calls
 - Parallel batch execution already in place (Promise.all) — confirmed working
