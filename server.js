@@ -9,6 +9,10 @@
 //            POST /entities/save endpoints. Admin pushes entities on every
 //            save/refresh/import. Client loads entities on page load.
 //
+// v1.24.0 — New feature: fetchFromNews now extracts og:image, og:title
+//             alongside article text and author — enables carousel post slides
+//             to show article headline, thumbnail and source favicon.
+//
 // v1.23.1 — Performance: Phase 2 enrichment now runs once for ALL top
 //             matches combined (was once per batch). Parallel batches already
 //             in place. Rate limit fallback: if 429, retries sequentially.
@@ -255,7 +259,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.23.1';
+const SERVER_VERSION = '1.24.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -1541,10 +1545,11 @@ async function fetchFromNews(url) {
              $('meta[property="og:title"]').attr('content') || '';
     }
     const title = $('meta[property="og:title"]').attr('content') || $('title').text() || '';
+    const ogImage = $('meta[property="og:image"]').attr('content') || $('meta[name="twitter:image"]').attr('content') || null;
     const author = $('meta[name="author"]').attr('content') ||
                    $('[rel="author"]').first().text() ||
                    $('[itemprop="author"]').first().text() || null;
-    return { text, title, author };
+    return { text, title, ogImage, author };
   }
 
   // Tier 1: Basic headers (current approach)
@@ -1562,11 +1567,11 @@ async function fetchFromNews(url) {
       });
       if (!response.ok) continue;
       const html = await response.text();
-      const { text, title, author } = extractArticle(html, url);
+      const { text, title, ogImage, author } = extractArticle(html, url);
       if (!text || text.length < 100) continue;
       const fullText = title ? `${title}\n\n${text}` : text;
       console.log(`News fetch (tier 1) success from ${domain}, length: ${fullText.length}`);
-      return await enrichWithYoutube(html, fullText, author, domain);
+      return await enrichWithYoutube(html, fullText, author, domain, title, ogImage);
     } catch(e) { console.log(`News fetch tier 1 error (${ua.slice(0,20)}):`, e.message); }
   }
 
@@ -1594,11 +1599,11 @@ async function fetchFromNews(url) {
     const response = await fetch(url, { headers: browserHeaders, redirect: 'follow' });
     if (response.ok) {
       const html = await response.text();
-      const { text, title, author } = extractArticle(html, url);
+      const { text, title, ogImage, author } = extractArticle(html, url);
       if (text && text.length >= 100) {
         const fullText = title ? `${title}\n\n${text}` : text;
         console.log(`News fetch (tier 2) success from ${domain}, length: ${fullText.length}`);
-        return await enrichWithYoutube(html, fullText, author, domain);
+        return await enrichWithYoutube(html, fullText, author, domain, title, ogImage);
       }
     }
   } catch(e) { console.log(`News fetch tier 2 error for ${domain}:`, e.message); }
@@ -1613,11 +1618,11 @@ async function fetchFromNews(url) {
     });
     if (response.ok) {
       const html = await response.text();
-      const { text, title, author } = extractArticle(html, url);
+      const { text, title, ogImage, author } = extractArticle(html, url);
       if (text && text.length >= 100) {
         const fullText = title ? `${title}\n\n${text}` : text;
         console.log(`News fetch (tier 3 archive.org) success from ${domain}, length: ${fullText.length}`);
-        return await enrichWithYoutube(html, fullText, author, domain);
+        return await enrichWithYoutube(html, fullText, author, domain, title, ogImage);
       }
     }
   } catch(e) { console.log(`News fetch tier 3 error for ${domain}:`, e.message); }
@@ -1625,7 +1630,7 @@ async function fetchFromNews(url) {
   throw new Error(`Could not fetch article from ${domain}. The article may be paywalled, require login, or not yet indexed. You can paste the article text manually below.`);
 }
 
-async function enrichWithYoutube(html, fullText, author, domain) {
+async function enrichWithYoutube(html, fullText, author, domain, ogTitle, ogImage) {
   const embeddedIds = extractEmbeddedYoutubeIds(html);
   let videoNote = '';
   if (embeddedIds.length > 0) {
@@ -1639,12 +1644,12 @@ async function enrichWithYoutube(html, fullText, author, domain) {
       const words = combined.split(' ');
       const trimmed = words.length > 3000 ? words.slice(0, 3000).join(' ') + '...' : combined;
       console.log(`News fetch: appended ${transcripts.length} YouTube transcript(s) from ${domain}`);
-      return { text: fullText + '\n\n' + trimmed, author: author ? author.trim() : null, authorHandle: author ? author.trim() : null, source: 'news', domain, hasVideoTranscript: true };
+      return { text: fullText + '\n\n' + trimmed, author: author ? author.trim() : null, authorHandle: author ? author.trim() : null, source: 'news', domain, hasVideoTranscript: true, ogTitle: ogTitle||null, ogImage: ogImage||null };
     } else {
       videoNote = 'Note: this article contains embedded video(s) whose transcript could not be retrieved. Analysis is based on article text only.';
     }
   }
-  return { text: fullText, author: author ? author.trim() : null, authorHandle: author ? author.trim() : null, source: 'news', domain, videoNote: videoNote || null };
+  return { text: fullText, author: author ? author.trim() : null, authorHandle: author ? author.trim() : null, source: 'news', domain, videoNote: videoNote || null, ogTitle: ogTitle||null, ogImage: ogImage||null };
 }
 
 // In-memory transcript cache — transcripts don't change once a video is published
