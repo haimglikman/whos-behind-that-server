@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v1.24.2 (server) | Admin: v2.18.5 | Client: v1.17.8
+- Expanded author extraction: 25+ selectors covering standard meta tags, Schema.org, common CSS classes, Israeli news site patterns, and data attributes
+- Author validation: length check (2-60 chars), word count (max 5), special character filter, URL filter, blacklist of editorial team names in Hebrew and English
+- Covers both English and Hebrew news sites
+
 ### v1.24.1 — bug fix (server) | Admin: v2.18.1 | Client: v1.17.8
 - New GET /proxy-image endpoint — proxies external images server-side to bypass CORS restrictions on canv
 
