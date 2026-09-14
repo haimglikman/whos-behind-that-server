@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.24.1 — bug fix (server) | Admin: v2.18.1 | Client: v1.17.8
+- New GET /proxy-image endpoint — proxies external images server-side to bypass CORS restrictions on canv
+
 ### v1.24.0 (server) | Admin: v2.18.0 | Client: v1.17.8
 - fetchFromNews now extracts and returns og:image and og:title alongside article text and author
 
