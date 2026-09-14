@@ -259,7 +259,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.24.0';
+const SERVER_VERSION = '1.24.1';
 
 import express from 'express';
 import cors from 'cors';
@@ -812,6 +812,28 @@ app.get('/client/sessions', async (req, res) => {
     res.json({ success: true, sessions: result.rows });
   } catch(err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// GET /proxy-image — proxy external images for canvas (CORS bypass)
+// ─────────────────────────────────────────────
+app.get('/proxy-image', async (req, res) => {
+  const url = req.query.url;
+  if (!url || !/^https?:\/\//.test(url)) return res.status(400).json({ error: 'Invalid URL' });
+  try {
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' }
+    });
+    if (!response.ok) return res.status(response.status).end();
+    const contentType = response.headers.get('content-type') || 'image/jpeg';
+    const buffer = await response.arrayBuffer();
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.send(Buffer.from(buffer));
+  } catch(e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
