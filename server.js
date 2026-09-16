@@ -259,7 +259,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.24.1';
+const SERVER_VERSION = '1.24.2';
 
 import express from 'express';
 import cors from 'cors';
@@ -1568,9 +1568,63 @@ async function fetchFromNews(url) {
     }
     const title = $('meta[property="og:title"]').attr('content') || $('title').text() || '';
     const ogImage = $('meta[property="og:image"]').attr('content') || $('meta[name="twitter:image"]').attr('content') || null;
-    const author = $('meta[name="author"]').attr('content') ||
-                   $('[rel="author"]').first().text() ||
-                   $('[itemprop="author"]').first().text() || null;
+
+    // Expanded author extraction with validation
+    const authorBlacklist = [
+      'כתב המערכת','כתבת המערכת','צוות המערכת','מערכת','editorial team','staff writer',
+      'staff','editor','admin','administrator','webmaster','reuters','ap','afp','jta',
+      'וואלה','ynet','mako','haaretz','globes','calcalist','israel hayom','kan','walla'
+    ];
+    function isValidAuthor(name) {
+      if (!name) return false;
+      const t = name.trim();
+      if (t.length < 2 || t.length > 60) return false;
+      if (t.split(/\s+/).length > 5) return false; // too many words
+      if (/[|©®@{}<>]/.test(t)) return false; // special chars
+      if (/https?:\/\//.test(t)) return false; // URL
+      if (/^\d+$/.test(t)) return false; // only numbers
+      const tl = t.toLowerCase();
+      if (authorBlacklist.some(b => tl.includes(b.toLowerCase()))) return false;
+      return true;
+    }
+    function firstValid(...candidates) {
+      for (const c of candidates) {
+        const t = (c||'').trim();
+        if (isValidAuthor(t)) return t;
+      }
+      return null;
+    }
+    const author = firstValid(
+      // Standard meta
+      $('meta[name="author"]').attr('content'),
+      $('meta[name="article:author"]').attr('content'),
+      $('meta[property="article:author"]').attr('content'),
+      $('meta[name="twitter:creator"]').attr('content'),
+      // Schema.org
+      $('[itemprop="author"] [itemprop="name"]').first().text(),
+      $('[itemprop="author"]').first().text(),
+      $('[rel="author"]').first().text(),
+      // Common class/id patterns (English + Hebrew)
+      $('.author-name').first().text(),
+      $('.author').first().text(),
+      $('.byline-author').first().text(),
+      $('.byline').first().text(),
+      $('.writer-name').first().text(),
+      $('.writer').first().text(),
+      $('.reporter').first().text(),
+      $('.article-author').first().text(),
+      $('.post-author').first().text(),
+      $('.entry-author').first().text(),
+      // Israeli news specific
+      $('.author-title').first().text(),
+      $('[data-author]').first().attr('data-author'),
+      $('[data-cy="author-name"]').first().text(),
+      $('[data-testid="author-name"]').first().text(),
+      $('[class*="author"]').first().text(),
+      $('[class*="writer"]').first().text(),
+      $('[class*="byline"]').first().text(),
+      $('[class*="reporter"]').first().text()
+    );
     return { text, title, ogImage, author };
   }
 
