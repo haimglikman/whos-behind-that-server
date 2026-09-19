@@ -259,7 +259,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.24.2';
+const SERVER_VERSION = '1.25.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -508,6 +508,7 @@ async function initDB() {
         [30,'Can someone know what I scanned for?','Your scan history is stored locally on your device and is private to you. The service operator (Who\'s Behind That?) can see anonymized scan data — the post URL, content, and results — linked only to a randomly generated device identifier. No personal information is collected or visible to us: no IP address, no email, no device identifiers such as MAC address, and no account information of any kind. Your scans are never shared with third parties.','Privacy',3],
         [31,'Is my data used to train AI models?','No. Your scan data is not used to train Claude or any other AI model. Post text is sent to Anthropic\'s Claude API for analysis and is subject to Anthropic\'s privacy policy, but Who\'s Behind That? does not share your data for training purposes.','Privacy',4],
         [32,'Does Who\'s Behind That? use cookies?','No, Who\'s Behind That? does not use cookies. Instead, it uses your browser\'s local storage to keep track of an anonymous device identifier, your scan history, and your daily quota — all of which stay on your device and are never sent automatically with requests the way cookies are. There\'s no cross-site tracking and no third-party tracking technology involved.','Privacy',5],
+        [33,'Does WBT detect bots?','Yes — when you research an actor, WBT estimates the likelihood that the account is a bot or inauthentic account. The assessment is shown as a percentage alongside the actor profile.\n\nThe detection is powered by Claude\'s web search, which surfaces publicly available profile information across platforms — X, Facebook, Instagram, news publications, and more. Since it relies on open-source intelligence rather than direct API access, signal quality varies by platform and account visibility.\n\nThe following signals are evaluated: bio authenticity (does it contain verifiable specifics like a job title, institution, or city, or is it a generic ideological template?); activity inflection (is there a sudden spike in posting volume from an otherwise dormant old account — a classic sign of a purchased or hijacked account?); follower/following ratio (mass-following with few followers back is a known signal); narrative focus (does the account post exclusively about one geopolitical topic with no personal content?); and account name patterns (suspiciously ideological or generated-looking names suggest a manufactured identity).\n\nJournalists and public figures with a verifiable publication history typically score very low. The score is a directional signal, not forensic proof.','Scanning logic',6],
       ];
       for (const [sortOrder, question, answer, group, so] of faqs) {
         await db.query(
@@ -2484,6 +2485,16 @@ Provide:
 2. bio: Factual 2-paragraph summary — background, what they are known for, political or ideological stance, notable work or affiliations. If anonymous or low-profile, state that clearly.
 3. location: Country or city (if publicly known). "Unknown" if not established.
 4. handles: Array of known social media handles, websites, or other online presence. Format: "X: @handle", "Website: domain.com". Only verified or highly likely matches.
+5. botProbability: Integer 0-100 estimating likelihood this is a bot or inauthentic account. Base this on:
+   - Bio authenticity: verifiable specifics (job, institution, city) vs generic/ideological template
+   - Activity inflection: old account with sudden recent spike in posting volume is suspicious
+   - Follower/following ratio: mass-following with few followers back is a signal
+   - Narrative focus: exclusively one geopolitical topic with no personal content
+   - Engagement: lots of retweets but little original content or genuine dialogue
+   - Account name: suspiciously ideological names suggest manufactured identity
+   - Journalists/authors with verified publication history score very low (0-15%)
+   - Use the string "Unknown" if there is genuinely insufficient data to assess
+6. botReasoning: 1-2 sentences in English explaining the assessment. Be specific about which signals drove the score.
 
 Be factual and neutral. Do not speculate beyond what is publicly known.
 
@@ -2492,14 +2503,16 @@ Respond ONLY with valid JSON:
   "name": "...",
   "bio": "...",
   "location": "...",
-  "handles": ["X: @handle"]
+  "handles": ["X: @handle"],
+  "botProbability": 25,
+  "botReasoning": "Established journalist with verified byline at major publication since 2015; no signs of inauthentic behavior."
 }`;
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-5', max_tokens: 800, temperature: 0,
+      model: 'claude-sonnet-4-5', max_tokens: 1000, temperature: 0,
       tools: [{ type: 'web_search_20250305', name: 'web_search' }],
       messages: [{ role: 'user', content: prompt }]
     })
@@ -2508,9 +2521,9 @@ Respond ONLY with valid JSON:
   const data = await response.json();
   const raw = data.content.filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
   const result = extractJSON(raw);
-  // Strip citation markup that web_search tool injects (e.g. <cite index="1-2">text</cite>)
   if (result.bio) result.bio = result.bio.replace(/<cite[^>]*>(.*?)<\/cite>/gs, '$1').replace(/\[\d+\]/g, '').trim();
   if (result.name) result.name = result.name.replace(/<cite[^>]*>(.*?)<\/cite>/gs, '$1').trim();
+  if (result.botReasoning) result.botReasoning = result.botReasoning.replace(/<cite[^>]*>(.*?)<\/cite>/gs, '$1').replace(/\[\d+\]/g, '').trim();
   result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
   return result;
 }
