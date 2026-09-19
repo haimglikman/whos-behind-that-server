@@ -1,5 +1,11 @@
 # Who's Behind That? — Server Changelog
 
+### v1.25.0 (server) | Admin: v2.20.0 | Client: v1.18.0
+- New: bot detection in actor research — botProbability (0-100 or "Unknown") and botReasoning added to every actor profile
+- Detection signals: bio authenticity, activity inflection (dormant account suddenly active), follower/following ratio, narrative focus, account name patterns
+- Works across all platforms via Claude web search — signal quality varies by platform visibility
+- FAQ entry added: "Does WBT detect bots?" under Scanning logic
+
 ### v1.24.2 (server) | Admin: v2.18.5 | Client: v1.17.8
 - Expanded author extraction: 25+ selectors covering standard meta tags, Schema.org, common CSS classes, Israeli news site patterns, and data attributes
 - Author validation: length check (2-60 chars), word count (max 5), special character filter, URL filter, blacklist of editorial team names in Hebrew and English
