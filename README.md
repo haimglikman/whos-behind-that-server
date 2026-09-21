@@ -1,5 +1,11 @@
 # Who's Behind That? — Server Changelog
 
+### v1.26.3 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
+- Fixed: form-data package replaced with Node 18 built-in FormData — no npm dependency needed
+- Fixed: Cobalt picker response (slideshows) now handled correctly
+- Improved: audio fetch follows redirects, logs content-length and status
+- Added: empty audio file detection with clear log message
+
 ### v1.26.2 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
 - Cobalt warm-up ping sent immediately on server start (not just every 10 min)
 - TikTok error message now distinguishes between missing config and Cobalt startup delay
