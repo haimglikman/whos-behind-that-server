@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.26.1 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
+- Cobalt keep-alive ping every 10 minutes — prevents Render free tier spin-down causing 502 errors on video transcript requests
+
 ### v1.26.0 (server) | Admin: v2.20.0 | Client: v1.18.0
 - New: video transcript support via Cobalt + Groq Whisper
   - Facebook videos/reels, Instagram reels, TikTok, X/Twitter videos now auto-transcribed
