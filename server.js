@@ -259,7 +259,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.25.1';
+const SERVER_VERSION = '1.26.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -269,6 +269,8 @@ import pg from 'pg';
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || '';
 const TRANSCRIPT_API_KEY = process.env.transcriptapi_API_KEY || '';
+const COBALT_URL = process.env.COBALT_URL || '';
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 
 // In-memory prompt cache — loaded from DB on startup, refreshed when admin saves
 const promptCache = {
@@ -891,16 +893,34 @@ app.post('/fetch-and-analyze', async (req, res) => {
   if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
   try {
     const platform = detectPlatform(url);
-    if (!platform) return res.status(400).json({ error: 'Unsupported URL. Paste a URL from X, Facebook, Instagram, YouTube, or a supported news website.' });
+    if (!platform) return res.status(400).json({ error: 'Unsupported URL. Paste a URL from X, Facebook, Instagram, TikTok, YouTube, or a supported news website.' });
     let postData;
-    if (platform === 'x') postData = await fetchFromX(url);
-    else if (platform === 'facebook') postData = await fetchFromFacebook(url);
-    else if (platform === 'instagram') postData = await fetchFromInstagram(url);
-    else if (platform === 'youtube') postData = await fetchFromYoutube(url);
-    else if (platform === 'news') postData = await fetchFromNews(url);
-    if (!postData.text) return res.status(422).json({ error: 'Could not extract text. The content may be private, paywalled, or the platform may be blocking access.' });
-    const minLen = (platform === 'news' || platform === 'youtube') ? 50 : 100;
-    if (postData.text.length < minLen) return res.status(422).json({ error: `Fetched text is too short (${postData.text.length} chars). Please paste the article text manually.` });
+
+    // For video-capable platforms, try Cobalt+Groq first
+    if (isVideoUrl(url) && COBALT_URL && GROQ_API_KEY) {
+      console.log('Video URL detected, attempting Cobalt+Groq transcript:', url);
+      const videoTranscript = await fetchVideoTranscript(url);
+      if (videoTranscript) {
+        postData = { text: videoTranscript, source: platform, domain: extractDomain(url), hasVideoTranscript: true };
+      }
+    }
+
+    // Fall back to regular platform fetch if no video transcript
+    if (!postData) {
+      if (platform === 'x') postData = await fetchFromX(url);
+      else if (platform === 'facebook') postData = await fetchFromFacebook(url);
+      else if (platform === 'instagram') postData = await fetchFromInstagram(url);
+      else if (platform === 'youtube') postData = await fetchFromYoutube(url);
+      else if (platform === 'tiktok') {
+        // TikTok has no text fallback — only video transcript works
+        throw new Error('Could not fetch TikTok content. Make sure COBALT_URL and GROQ_API_KEY are configured, or paste the caption manually.');
+      }
+      else if (platform === 'news') postData = await fetchFromNews(url);
+    }
+
+    if (!postData || !postData.text) return res.status(422).json({ error: 'Could not extract text. The content may be private, paywalled, or the platform may be blocking access. Try pasting the text manually.' });
+    const minLen = (platform === 'news' || platform === 'youtube') ? 50 : 30;
+    if (postData.text.length < minLen) return res.status(422).json({ error: `Fetched text is too short (${postData.text.length} chars). Please paste the content text manually.` });
     const analysis = await scoreWithClaude(postData.text, entities);
     const responseUrl = postData.normalizedUrl || url;
     const tokens = analysis._tokens || { input: 0, output: 0 };
@@ -1476,15 +1496,15 @@ Or: { "found": false }`;
 
 function detectPlatform(url) {
   if (/x\.com|twitter\.com/i.test(url)) return 'x';
-  if (/facebook\.com|fb\.com/i.test(url)) return 'facebook';
+  if (/facebook\.com|fb\.com|fb\.watch/i.test(url)) return 'facebook';
   if (/instagram\.com/i.test(url)) return 'instagram';
   if (/youtube\.com|youtu\.be/i.test(url)) return 'youtube';
+  if (/tiktok\.com/i.test(url)) return 'tiktok';
   if (isNewsDomain(url)) return 'news';
-  // Fall back to news for any URL with an article-like path (not just a homepage)
+  // Fall back to news for any URL with an article-like path
   try {
     const parsed = new URL(url);
     const path = parsed.pathname;
-    // Looks like an article if path has at least 2 segments or contains numbers/words
     if (path && path.length > 1 && path !== '/') return 'news';
   } catch(e) {}
   return null;
@@ -1541,6 +1561,95 @@ async function fetchYoutubeTranscript(videoId) {
     return result;
   } catch(e) {
     console.log('TranscriptAPI error for', videoId, ':', e.message);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────
+// VIDEO TRANSCRIPT via Cobalt + Groq Whisper
+// Supports: Facebook, Instagram, TikTok, X/Twitter videos
+// ─────────────────────────────────────────────
+function isVideoUrl(url) {
+  if (!url) return false;
+  if (/tiktok\.com\/@[^/]+\/video\//i.test(url)) return true;
+  if (/instagram\.com\/(reel|p|tv)\//i.test(url)) return true;
+  if (/facebook\.com\/.+\/(videos|reel)\//i.test(url)) return true;
+  if (/fb\.watch\//i.test(url)) return true;
+  if (/x\.com\/.+\/status\//i.test(url)) return true; // may have video
+  if (/twitter\.com\/.+\/status\//i.test(url)) return true;
+  return false;
+}
+
+async function fetchVideoTranscript(url) {
+  if (!COBALT_URL || !GROQ_API_KEY) {
+    console.log('Video transcript: COBALT_URL or GROQ_API_KEY not set, skipping');
+    return null;
+  }
+  try {
+    // Step 1: Get audio URL from Cobalt
+    console.log('Cobalt: requesting audio for', url);
+    const cobaltRes = await fetch(COBALT_URL + '/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ url, downloadMode: 'audio', audioFormat: 'mp3', audioBitrate: '64' })
+    });
+    if (!cobaltRes.ok) {
+      const err = await cobaltRes.text();
+      console.log('Cobalt error:', cobaltRes.status, err.slice(0, 200));
+      return null;
+    }
+    const cobaltData = await cobaltRes.json();
+    if (cobaltData.status === 'error') {
+      console.log('Cobalt returned error:', cobaltData.error?.code);
+      return null;
+    }
+    const audioUrl = cobaltData.url;
+    if (!audioUrl) { console.log('Cobalt: no audio URL returned'); return null; }
+    console.log('Cobalt: got audio URL, fetching audio...');
+
+    // Step 2: Fetch audio file into buffer
+    const audioRes = await fetch(audioUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' }
+    });
+    if (!audioRes.ok) { console.log('Audio fetch failed:', audioRes.status); return null; }
+    const audioBuffer = await audioRes.arrayBuffer();
+    const audioBytes = Buffer.from(audioBuffer);
+
+    // Check size — Groq limit is 25MB
+    if (audioBytes.length > 24 * 1024 * 1024) {
+      console.log('Audio too large for Groq:', audioBytes.length, 'bytes — truncating not supported, skipping');
+      return null;
+    }
+    console.log(`Audio fetched: ${(audioBytes.length / 1024).toFixed(0)} KB, sending to Groq Whisper...`);
+
+    // Step 3: Send to Groq Whisper
+    const FormData = (await import('form-data')).default;
+    const form = new FormData();
+    form.append('file', audioBytes, { filename: 'audio.mp3', contentType: 'audio/mpeg' });
+    form.append('model', 'whisper-large-v3');
+    form.append('response_format', 'json');
+
+    const groqRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, ...form.getHeaders() },
+      body: form
+    });
+    if (!groqRes.ok) {
+      const err = await groqRes.text();
+      console.log('Groq Whisper error:', groqRes.status, err.slice(0, 200));
+      return null;
+    }
+    const groqData = await groqRes.json();
+    const transcript = (groqData.text || '').trim();
+    if (!transcript || transcript.length < 20) { console.log('Groq: transcript too short'); return null; }
+
+    // Trim to 3000 words
+    const words = transcript.split(' ');
+    const result = words.length > 3000 ? words.slice(0, 3000).join(' ') + '...' : transcript;
+    console.log(`Groq Whisper: transcribed ${words.length} words from ${url}`);
+    return result;
+  } catch(e) {
+    console.log('fetchVideoTranscript error:', e.message);
     return null;
   }
 }
