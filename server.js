@@ -259,7 +259,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.25.0';
+const SERVER_VERSION = '1.25.1';
 
 import express from 'express';
 import cors from 'cors';
@@ -2494,7 +2494,7 @@ Provide:
    - Account name: suspiciously ideological names suggest manufactured identity
    - Journalists/authors with verified publication history score very low (0-15%)
    - Use the string "Unknown" if there is genuinely insufficient data to assess
-6. botReasoning: 1-2 sentences in English explaining the assessment. Be specific about which signals drove the score.
+6. botReasoning: 1-2 sentences in English explaining the score. Mention the 2-3 strongest signals — both those pointing toward authentic AND any that raised suspicion. Format: "[score]% — [strongest human signals]; [suspicious signals or 'no significant bot signals detected']." Example: "20% — real identity with verifiable LinkedIn and career history, account active since 2020 with consistent political voice; no significant bot signals detected."
 
 Be factual and neutral. Do not speculate beyond what is publicly known.
 
