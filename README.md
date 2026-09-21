@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.25.1 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
+- Bot reasoning now follows structured format: "[score]% — [human signals]; [suspicious signals or 'no significant bot signals detected']" — more informative and directly tied to the score
+
 ### v1.25.0 (server) | Admin: v2.20.0 | Client: v1.18.0
 - New: bot detection in actor research — botProbability (0-100 or "Unknown") and botReasoning added to every actor profile
 - Detection signals: bio authenticity, activity inflection (dormant account suddenly active), follower/following ratio, narrative focus, account name patterns
