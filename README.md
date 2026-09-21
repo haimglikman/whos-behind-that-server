@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.26.9 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
+- Fixed server crash: require('fs') replaced with dynamic import — ES modules don't support require()
+
 ### v1.26.8 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
 - Fixed server crash on startup: https/http imports moved to top of file — ES modules require all imports at top-level
 
