@@ -259,7 +259,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.26.1';
+const SERVER_VERSION = '1.26.2';
 
 import express from 'express';
 import cors from 'cors';
@@ -913,7 +913,10 @@ app.post('/fetch-and-analyze', async (req, res) => {
       else if (platform === 'youtube') postData = await fetchFromYoutube(url);
       else if (platform === 'tiktok') {
         // TikTok has no text fallback — only video transcript works
-        throw new Error('Could not fetch TikTok content. Make sure COBALT_URL and GROQ_API_KEY are configured, or paste the caption manually.');
+        if (!COBALT_URL || !GROQ_API_KEY) {
+          throw new Error('TikTok requires video transcription (COBALT_URL and GROQ_API_KEY must be configured). Paste the caption manually instead.');
+        }
+        throw new Error('Could not transcribe TikTok video. The video may be private, or Cobalt may be starting up — try again in 30 seconds.');
       }
       else if (platform === 'news') postData = await fetchFromNews(url);
     }
@@ -2742,6 +2745,11 @@ initDB().then(() => {
 
     // Keep Cobalt alive on Render free tier — ping every 10 minutes
     if (COBALT_URL) {
+      // Immediate warm-up ping on start
+      fetch(COBALT_URL + '/', { method: 'GET' })
+        .then(function(){ console.log('Cobalt warm-up ping sent'); })
+        .catch(function(e){ console.warn('Cobalt warm-up ping failed:', e.message); });
+      // Then every 10 minutes
       setInterval(async function() {
         try {
           await fetch(COBALT_URL + '/', { method: 'GET' });
