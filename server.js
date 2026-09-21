@@ -259,7 +259,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.26.2';
+const SERVER_VERSION = '1.26.3';
 
 import express from 'express';
 import cors from 'cors';
@@ -1602,39 +1602,49 @@ async function fetchVideoTranscript(url) {
       return null;
     }
     const cobaltData = await cobaltRes.json();
+    console.log('Cobalt response status:', cobaltData.status);
     if (cobaltData.status === 'error') {
-      console.log('Cobalt returned error:', cobaltData.error?.code);
+      console.log('Cobalt returned error:', cobaltData.error?.code, cobaltData.error?.context);
       return null;
+    }
+    if (cobaltData.status === 'picker') {
+      // Video slideshow — try first video item
+      const first = (cobaltData.picker||[])[0];
+      if (!first || !first.url) { console.log('Cobalt picker: no usable URL'); return null; }
+      cobaltData.url = first.url;
     }
     const audioUrl = cobaltData.url;
-    if (!audioUrl) { console.log('Cobalt: no audio URL returned'); return null; }
+    if (!audioUrl) { console.log('Cobalt: no audio URL in response:', JSON.stringify(cobaltData).slice(0,200)); return null; }
     console.log('Cobalt: got audio URL, fetching audio...');
 
-    // Step 2: Fetch audio file into buffer
+    // Step 2: Fetch audio — follow redirects, stream to buffer
     const audioRes = await fetch(audioUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' }
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'Accept': '*/*'
+      },
+      redirect: 'follow'
     });
-    if (!audioRes.ok) { console.log('Audio fetch failed:', audioRes.status); return null; }
+    if (!audioRes.ok) { console.log('Audio fetch failed:', audioRes.status, audioRes.statusText); return null; }
+    const contentLength = audioRes.headers.get('content-length');
+    console.log('Audio response: status', audioRes.status, 'content-length', contentLength);
     const audioBuffer = await audioRes.arrayBuffer();
     const audioBytes = Buffer.from(audioBuffer);
+    console.log(`Audio fetched: ${(audioBytes.length / 1024).toFixed(0)} KB`);
+    if (audioBytes.length === 0) { console.log('Audio file is empty — Cobalt tunnel may have expired'); return null; }
+    if (audioBytes.length > 24 * 1024 * 1024) { console.log('Audio too large for Groq, skipping'); return null; }
+    console.log('Sending to Groq Whisper...');
 
-    // Check size — Groq limit is 25MB
-    if (audioBytes.length > 24 * 1024 * 1024) {
-      console.log('Audio too large for Groq:', audioBytes.length, 'bytes — truncating not supported, skipping');
-      return null;
-    }
-    console.log(`Audio fetched: ${(audioBytes.length / 1024).toFixed(0)} KB, sending to Groq Whisper...`);
-
-    // Step 3: Send to Groq Whisper
-    const FormData = (await import('form-data')).default;
+    // Step 3: Send to Groq Whisper using built-in FormData (Node 18+)
     const form = new FormData();
-    form.append('file', audioBytes, { filename: 'audio.mp3', contentType: 'audio/mpeg' });
+    const blob = new Blob([audioBytes], { type: 'audio/mpeg' });
+    form.append('file', blob, 'audio.mp3');
     form.append('model', 'whisper-large-v3');
     form.append('response_format', 'json');
 
     const groqRes = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, ...form.getHeaders() },
+      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}` },
       body: form
     });
     if (!groqRes.ok) {
