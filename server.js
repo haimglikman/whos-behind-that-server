@@ -259,7 +259,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.26.3';
+const SERVER_VERSION = '1.26.4';
 
 import express from 'express';
 import cors from 'cors';
@@ -1617,7 +1617,7 @@ async function fetchVideoTranscript(url) {
     if (!audioUrl) { console.log('Cobalt: no audio URL in response:', JSON.stringify(cobaltData).slice(0,200)); return null; }
     console.log('Cobalt: got audio URL, fetching audio...');
 
-    // Step 2: Fetch audio — follow redirects, stream to buffer
+    // Step 2: Fetch audio via streaming to handle Cobalt tunnel correctly
     const audioRes = await fetch(audioUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
@@ -1628,9 +1628,19 @@ async function fetchVideoTranscript(url) {
     if (!audioRes.ok) { console.log('Audio fetch failed:', audioRes.status, audioRes.statusText); return null; }
     const contentLength = audioRes.headers.get('content-length');
     console.log('Audio response: status', audioRes.status, 'content-length', contentLength);
-    const audioBuffer = await audioRes.arrayBuffer();
-    const audioBytes = Buffer.from(audioBuffer);
-    console.log(`Audio fetched: ${(audioBytes.length / 1024).toFixed(0)} KB`);
+
+    // Stream chunks into buffer (handles transfer-encoding: chunked from Cobalt tunnel)
+    const chunks = [];
+    const reader = audioRes.body.getReader();
+    let totalBytes = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      totalBytes += value.length;
+    }
+    const audioBytes = Buffer.concat(chunks.map(c => Buffer.from(c)));
+    console.log(`Audio fetched: ${(audioBytes.length / 1024).toFixed(0)} KB (${totalBytes} bytes streamed)`);
     if (audioBytes.length === 0) { console.log('Audio file is empty — Cobalt tunnel may have expired'); return null; }
     if (audioBytes.length > 24 * 1024 * 1024) { console.log('Audio too large for Groq, skipping'); return null; }
     console.log('Sending to Groq Whisper...');
