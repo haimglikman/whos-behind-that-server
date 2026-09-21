@@ -259,13 +259,15 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.26.7';
+const SERVER_VERSION = '1.26.8';
 
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
 import pg from 'pg';
+import https from 'https';
+import http from 'http';
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || '';
 const TRANSCRIPT_API_KEY = process.env.transcriptapi_API_KEY || '';
@@ -1564,9 +1566,6 @@ async function fetchYoutubeTranscript(videoId) {
     return null;
   }
 }
-
-import https from 'https';
-import http from 'http';
 
 function fetchBuffer(url, redirectCount = 0) {
   return new Promise(function(resolve, reject) {
