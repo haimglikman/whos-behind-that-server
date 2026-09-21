@@ -259,7 +259,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.26.8';
+const SERVER_VERSION = '1.26.9';
 
 import express from 'express';
 import cors from 'cors';
@@ -1663,7 +1663,7 @@ async function fetchVideoTranscript(url) {
     return result;
   } catch(e) {
     console.log('fetchVideoTranscript error:', e.message);
-    try { require('fs').unlinkSync(tmpBase+'.mp3'); } catch(err) {}
+    try { (await import('fs')).default.unlinkSync(tmpBase+'.mp3'); } catch(err) {}
     return null;
   }
 }
