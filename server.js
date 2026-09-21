@@ -259,7 +259,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.26.4';
+const SERVER_VERSION = '1.26.5';
 
 import express from 'express';
 import cors from 'cors';
@@ -1568,6 +1568,37 @@ async function fetchYoutubeTranscript(videoId) {
   }
 }
 
+import https from 'https';
+import http from 'http';
+
+function fetchBuffer(url, redirectCount = 0) {
+  return new Promise(function(resolve, reject) {
+    if (redirectCount > 5) { reject(new Error('Too many redirects')); return; }
+    const urlObj = new URL(url);
+    const lib = urlObj.protocol === 'https:' ? https : http;
+    const req = lib.request({
+      hostname: urlObj.hostname,
+      port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
+      path: urlObj.pathname + urlObj.search,
+      method: 'GET',
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': '*/*' }
+    }, function(res) {
+      console.log('Audio response: status', res.statusCode, 'content-length', res.headers['content-length'], 'transfer-encoding', res.headers['transfer-encoding']);
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        resolve(fetchBuffer(res.headers.location, redirectCount + 1));
+        return;
+      }
+      if (res.statusCode < 200 || res.statusCode >= 300) { reject(new Error('HTTP ' + res.statusCode)); return; }
+      const chunks = [];
+      res.on('data', function(c){ chunks.push(c); });
+      res.on('end', function(){ resolve(Buffer.concat(chunks)); });
+      res.on('error', reject);
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 // ─────────────────────────────────────────────
 // VIDEO TRANSCRIPT via Cobalt + Groq Whisper
 // Supports: Facebook, Instagram, TikTok, X/Twitter videos
@@ -1617,30 +1648,13 @@ async function fetchVideoTranscript(url) {
     if (!audioUrl) { console.log('Cobalt: no audio URL in response:', JSON.stringify(cobaltData).slice(0,200)); return null; }
     console.log('Cobalt: got audio URL, fetching audio...');
 
-    // Step 2: Fetch audio via streaming to handle Cobalt tunnel correctly
-    const audioRes = await fetch(audioUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-        'Accept': '*/*'
-      },
-      redirect: 'follow'
-    });
-    if (!audioRes.ok) { console.log('Audio fetch failed:', audioRes.status, audioRes.statusText); return null; }
-    const contentLength = audioRes.headers.get('content-length');
-    console.log('Audio response: status', audioRes.status, 'content-length', contentLength);
-
-    // Stream chunks into buffer (handles transfer-encoding: chunked from Cobalt tunnel)
-    const chunks = [];
-    const reader = audioRes.body.getReader();
-    let totalBytes = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      totalBytes += value.length;
-    }
-    const audioBytes = Buffer.concat(chunks.map(c => Buffer.from(c)));
-    console.log(`Audio fetched: ${(audioBytes.length / 1024).toFixed(0)} KB (${totalBytes} bytes streamed)`);
+    // Step 2: Fetch audio using Node https/http module to handle chunked transfer from Cobalt tunnel
+    const audioBytes = await fetchBuffer(audioUrl);
+    if (!audioBytes) { console.log('Audio fetch failed'); return null; }
+    console.log(`Audio fetched: ${(audioBytes.length / 1024).toFixed(0)} KB`);
+    if (audioBytes.length === 0) { console.log('Audio file is empty'); return null; }
+    if (audioBytes.length > 24 * 1024 * 1024) { console.log('Audio too large for Groq, skipping'); return null; }
+    console.log('Sending to Groq Whisper...');
     if (audioBytes.length === 0) { console.log('Audio file is empty — Cobalt tunnel may have expired'); return null; }
     if (audioBytes.length > 24 * 1024 * 1024) { console.log('Audio too large for Groq, skipping'); return null; }
     console.log('Sending to Groq Whisper...');
