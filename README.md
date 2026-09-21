@@ -1,5 +1,11 @@
 # Who's Behind That? — Server Changelog
 
+### v1.26.7 (server) | Admin: v2.20.0 | Client: v1.18.0
+- Replaced Cobalt with yt-dlp for video audio extraction — yt-dlp downloads audio directly from TikTok/Instagram/Facebook/X, bypassing the Cobalt tunnel 0-byte bug entirely
+- yt-dlp is installed automatically on first use if not present
+- COBALT_URL env var no longer needed — Cobalt service can be shut down
+- GROQ_API_KEY still required for Groq Whisper transcription
+
 ### v1.26.6 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
 - Cobalt request now sets alwaysProxy:false to get redirect to CDN directly instead of tunnel URL — tunnel URLs were expiring before audio could be fetched
 
