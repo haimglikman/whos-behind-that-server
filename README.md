@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v1.26.5 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
+- Fixed: audio streaming from Cobalt tunnel now uses Node's native https/http module with proper chunked transfer encoding support — replaces fetch() which couldn't handle chunked responses
+- Added redirect following in fetchBuffer helper
+
 ### v1.26.4 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
 - Fixed: audio from Cobalt tunnel now read via streaming chunks instead of arrayBuffer() — fixes 0 KB issue with chunked transfer encoding
 
