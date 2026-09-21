@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.26.6 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
+- Cobalt request now sets alwaysProxy:false to get redirect to CDN directly instead of tunnel URL — tunnel URLs were expiring before audio could be fetched
+
 ### v1.26.5 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
 - Fixed: audio streaming from Cobalt tunnel now uses Node's native https/http module with proper chunked transfer encoding support — replaces fetch() which couldn't handle chunked responses
 - Added redirect following in fetchBuffer helper
