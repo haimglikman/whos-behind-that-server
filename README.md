@@ -1,5 +1,11 @@
 # Who's Behind That? — Server Changelog
 
+### v1.27.0 (server) | Admin: v2.20.0 | Client: v1.18.0 - USED OPUS 5
+- Video transcription re-architected: yt-dlp standalone binary (auto-downloaded to /tmp) + Groq Whisper
+- Cobalt removed entirely — COBALT_URL no longer used, wbt-cobalt service can be deleted
+- No Python, ffmpeg, or new npm dependencies required
+- Rebuilt from full v1.26.5 source — v1.26.7–v1.26.9 were built on a truncated file and failed to start
+
 ### v1.26.9 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
 - Fixed server crash: require('fs') replaced with dynamic import — ES modules don't support require()
 
