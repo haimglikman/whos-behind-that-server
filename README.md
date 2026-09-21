@@ -1,5 +1,14 @@
 # Who's Behind That? — Server Changelog
 
+### v1.26.0 (server) | Admin: v2.20.0 | Client: v1.18.0
+- New: video transcript support via Cobalt + Groq Whisper
+  - Facebook videos/reels, Instagram reels, TikTok, X/Twitter videos now auto-transcribed
+  - Cobalt (self-hosted) extracts audio, Groq whisper-large-v3 transcribes it
+  - Falls back to regular text fetch if Cobalt/Groq not configured
+  - 25MB audio file limit; videos over ~2 hours may be skipped
+- TikTok added to detectPlatform()
+- New env vars: COBALT_URL, GROQ_API_KEY
+
 ### v1.25.1 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
 - Bot reasoning now follows structured format: "[score]% — [human signals]; [suspicious signals or 'no significant bot signals detected']" — more informative and directly tied to the score
 
