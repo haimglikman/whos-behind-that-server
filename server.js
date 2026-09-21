@@ -259,7 +259,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.26.0';
+const SERVER_VERSION = '1.26.1';
 
 import express from 'express';
 import cors from 'cors';
@@ -2739,5 +2739,18 @@ initDB().then(() => {
     console.log(`Who's Behind That? server v${SERVER_VERSION} running on port ${PORT}`);
     if (!ANTHROPIC_KEY) console.warn('WARNING: ANTHROPIC_API_KEY not set — scoring endpoints will fail');
     if (!db) console.warn('WARNING: DATABASE_URL not set — history endpoints will be unavailable');
+
+    // Keep Cobalt alive on Render free tier — ping every 10 minutes
+    if (COBALT_URL) {
+      setInterval(async function() {
+        try {
+          await fetch(COBALT_URL + '/', { method: 'GET' });
+          console.log('Cobalt keep-alive ping sent');
+        } catch(e) {
+          console.warn('Cobalt keep-alive ping failed:', e.message);
+        }
+      }, 10 * 60 * 1000);
+      console.log('Cobalt keep-alive ping scheduled every 10 minutes');
+    }
   });
 });
