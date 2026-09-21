@@ -259,7 +259,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.26.5';
+const SERVER_VERSION = '1.26.6';
 
 import express from 'express';
 import cors from 'cors';
@@ -1625,7 +1625,7 @@ async function fetchVideoTranscript(url) {
     const cobaltRes = await fetch(COBALT_URL + '/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({ url, downloadMode: 'audio', audioFormat: 'mp3', audioBitrate: '64' })
+      body: JSON.stringify({ url, downloadMode: 'audio', audioFormat: 'mp3', audioBitrate: '64', alwaysProxy: false })
     });
     if (!cobaltRes.ok) {
       const err = await cobaltRes.text();
@@ -1646,7 +1646,7 @@ async function fetchVideoTranscript(url) {
     }
     const audioUrl = cobaltData.url;
     if (!audioUrl) { console.log('Cobalt: no audio URL in response:', JSON.stringify(cobaltData).slice(0,200)); return null; }
-    console.log('Cobalt: got audio URL, fetching audio...');
+    console.log('Cobalt: got audio URL:', audioUrl.slice(0, 80), '..., fetching audio...');
 
     // Step 2: Fetch audio using Node https/http module to handle chunked transfer from Cobalt tunnel
     const audioBytes = await fetchBuffer(audioUrl);
