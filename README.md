@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.26.4 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
+- Fixed: audio from Cobalt tunnel now read via streaming chunks instead of arrayBuffer() — fixes 0 KB issue with chunked transfer encoding
+
 ### v1.26.3 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
 - Fixed: form-data package replaced with Node 18 built-in FormData — no npm dependency needed
 - Fixed: Cobalt picker response (slideshows) now handled correctly
