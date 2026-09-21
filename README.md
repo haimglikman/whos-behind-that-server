@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v1.26.2 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
+- Cobalt warm-up ping sent immediately on server start (not just every 10 min)
+- TikTok error message now distinguishes between missing config and Cobalt startup delay
+
 ### v1.26.1 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
 - Cobalt keep-alive ping every 10 minutes — prevents Render free tier spin-down causing 502 errors on video transcript requests
 
