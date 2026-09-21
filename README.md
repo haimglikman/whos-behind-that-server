@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v1.26.8 — bug fix (server) | Admin: v2.20.0 | Client: v1.18.0
+- Fixed server crash on startup: https/http imports moved to top of file — ES modules require all imports at top-level
+
 ### v1.26.7 (server) | Admin: v2.20.0 | Client: v1.18.0
 - Replaced Cobalt with yt-dlp for video audio extraction — yt-dlp downloads audio directly from TikTok/Instagram/Facebook/X, bypassing the Cobalt tunnel 0-byte bug entirely
 - yt-dlp is installed automatically on first use if not present
