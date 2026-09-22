@@ -5,6 +5,14 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v1.28.0 — Video context: same yt-dlp call now also returns metadata
+//             (caption, hashtags, account, title, thumbnail). Video scans are
+//             sent to Claude with a generic context note (transcript = speech
+//             only, no on-screen text/visuals/speaker IDs; judge overall
+//             framing, not single quoted lines) + caption + transcript.
+//             Caption-only fallback when there is no usable speech.
+//             Account/title/thumbnail also feed carousel metadata.
+//
 // v1.27.0 — Video transcription re-architected: yt-dlp standalone binary
 //             (auto-downloaded to /tmp) + Groq Whisper. Cobalt removed
 //             entirely (tunnel returned 0-byte bodies on Render). No Python,
@@ -267,7 +275,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '1.27.0';
+const SERVER_VERSION = '1.28.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -911,9 +919,15 @@ app.post('/fetch-and-analyze', async (req, res) => {
     // Video platforms: try yt-dlp + Groq Whisper first
     if (isVideoUrl(url) && GROQ_API_KEY) {
       console.log('Video URL detected, attempting yt-dlp + Groq transcript:', url);
-      const videoTranscript = await fetchVideoTranscript(url);
-      if (videoTranscript) {
-        postData = { text: videoTranscript, source: platform, domain: extractDomain(url), hasVideoTranscript: true };
+      const video = await fetchVideoTranscript(url);
+      if (video) {
+        postData = {
+          text: buildVideoAnalysisText(video, platform),
+          source: platform, domain: extractDomain(url), hasVideoTranscript: true,
+          author: video.uploader, authorHandle: video.uploader,
+          ogTitle: video.title || (video.caption ? video.caption.slice(0, 120) : null),
+          ogImage: video.thumbnail
+        };
       }
     }
 
@@ -1619,22 +1633,42 @@ async function fetchVideoTranscript(url) {
   if (!GROQ_API_KEY) { console.log('Video transcript: GROQ_API_KEY not set'); return null; }
   const base = nodePath.join(nodeOs.tmpdir(), 'wbt_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7));
   let outFile = null;
+  let ytStdout = '';
   try {
     const bin = await ensureYtdlp();
     console.log('yt-dlp: fetching audio for', url);
     // Audio-only stream as-is (no conversion → no ffmpeg needed). Fallback to smallest full file.
     await execFileAsync(bin, [
       '-f', 'ba[filesize<24M]/ba/w[filesize<24M]/w',
+      '-j', '--no-simulate',
       '--no-playlist', '--no-warnings', '--quiet',
       '--max-filesize', '24M',
       '-o', base + '.%(ext)s',
       url
-    ], { timeout: 90000, maxBuffer: 10 * 1024 * 1024 });
+    ], { timeout: 90000, maxBuffer: 20 * 1024 * 1024 }).then(r => { ytStdout = r.stdout || ''; });
+
+    // Metadata (caption, title, account, thumbnail) — optional, never fatal
+    let meta = {};
+    try {
+      const line = ytStdout.trim().split('\n').filter(Boolean).pop();
+      if (line) meta = JSON.parse(line);
+    } catch (_) { console.log('yt-dlp: metadata parse failed (continuing with audio only)'); }
+    const caption = String(meta.description || '').trim().slice(0, 1500);
+    const tags = Array.isArray(meta.tags) ? meta.tags.filter(t => t && !caption.includes(t)).slice(0, 15) : [];
+    const info = {
+      caption, tags,
+      title: String(meta.title || '').trim().slice(0, 200) || null,
+      uploader: meta.uploader_id || meta.uploader || meta.channel || null,
+      thumbnail: meta.thumbnail || null
+    };
 
     const dir = nodeOs.tmpdir();
     const prefix = nodePath.basename(base);
     const match = nodeFs.readdirSync(dir).find(f => f.startsWith(prefix) && !f.endsWith('.part'));
-    if (!match) { console.log('yt-dlp: no output file produced'); return null; }
+    if (!match) {
+      console.log('yt-dlp: no output file produced');
+      return info.caption.length >= 30 ? Object.assign(info, { transcript: '' }) : null;
+    }
     outFile = nodePath.join(dir, match);
     const bytes = nodeFs.readFileSync(outFile);
     const ext = (match.split('.').pop() || 'mp4').toLowerCase();
@@ -1652,19 +1686,43 @@ async function fetchVideoTranscript(url) {
       headers: { 'Authorization': 'Bearer ' + GROQ_API_KEY },
       body: form
     });
-    if (!groqRes.ok) { console.log('Groq error:', groqRes.status, (await groqRes.text()).slice(0, 300)); return null; }
-    const data = await groqRes.json();
-    const transcript = (data.text || '').replace(/\s+/g, ' ').trim();
-    if (transcript.length < 20) { console.log('Groq: transcript too short'); return null; }
+    let transcript = '';
+    if (!groqRes.ok) {
+      console.log('Groq error:', groqRes.status, (await groqRes.text()).slice(0, 300));
+    } else {
+      const data = await groqRes.json();
+      transcript = (data.text || '').replace(/\s+/g, ' ').trim();
+    }
+    if (transcript.length < 20) {
+      console.log('Groq: no usable speech (' + transcript.length + ' chars)');
+      if (info.caption.length >= 30) { console.log('Using caption only'); return Object.assign(info, { transcript: '' }); }
+      return null;
+    }
     const words = transcript.split(' ');
-    console.log('Groq Whisper: transcribed ' + words.length + ' words');
-    return words.length > 3000 ? words.slice(0, 3000).join(' ') + '...' : transcript;
+    console.log('Groq Whisper: transcribed ' + words.length + ' words; caption ' + info.caption.length + ' chars');
+    return Object.assign(info, { transcript: words.length > 3000 ? words.slice(0, 3000).join(' ') + '...' : transcript });
   } catch (e) {
     console.log('fetchVideoTranscript error:', (e.stderr || e.message || '').toString().slice(0, 300));
     return null;
   } finally {
     if (outFile) { try { nodeFs.unlinkSync(outFile); } catch (_) {} }
   }
+}
+
+const VIDEO_PLATFORM_NAMES = { tiktok: 'TikTok', instagram: 'Instagram', facebook: 'Facebook', x: 'X' };
+
+function buildVideoAnalysisText(video, platform) {
+  const name = VIDEO_PLATFORM_NAMES[platform] || 'Video';
+  const parts = [];
+  parts.push('[CONTEXT FOR ANALYSIS: This is a ' + name + ' video, not a text post. Below are the creator\'s caption (if any) and an automatic transcript of the audio. ' +
+    'The transcript contains speech only — on-screen text, visuals, editing, and music are NOT included, and speakers are NOT identified. ' +
+    'Videos often include clips, quotes, or impersonations of other people, so a quoted statement may belong to someone the creator opposes, not to the creator. ' +
+    'Judge whose agenda the video advances from its overall framing — the caption, the structure, and how quoted material is presented — rather than from any single line.]');
+  if (video.uploader) parts.push('Account: @' + String(video.uploader).replace(/^@/, ''));
+  if (video.caption) parts.push('Creator caption: ' + video.caption);
+  if (video.tags && video.tags.length) parts.push('Hashtags: ' + video.tags.map(t => '#' + t).join(' '));
+  parts.push(video.transcript ? ('Audio transcript: ' + video.transcript) : 'Audio transcript: (no usable speech detected — analyze from the caption only)');
+  return parts.join('\n\n');
 }
 
 async function fetchFromNews(url) {
