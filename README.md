@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v1.28.0 (server) | Admin: v2.20.0 | Client: v1.18.0
+- Video scans now include context: generic note on transcript limits (speech only, no on-screen text/visuals/speaker IDs; judge overall framing), plus creator caption, hashtags, and account — fetched in the same yt-dlp call at no extra cost
+- Caption-only fallback when a video has no usable speech
+- Video account, title, and thumbnail now populate carousel metadata
+
 ### v1.27.0 (server) | Admin: v2.20.0 | Client: v1.18.0 - USED OPUS 5
 - Video transcription re-architected: yt-dlp standalone binary (auto-downloaded to /tmp) + Groq Whisper
 - Cobalt removed entirely — COBALT_URL no longer used, wbt-cobalt service can be deleted
