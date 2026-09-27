@@ -1,6 +1,6 @@
 {
   "name": "whos-behind-that-server",
-  "version": "2.0.5",
+  "version": "2.1.0",
   "description": "Who's Behind That? — API server (Jev screening + Claude judging)",
   "type": "module",
   "main": "server.js",

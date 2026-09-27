@@ -5,6 +5,15 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v2.1.0 — Telegram support (public channels, no login). Post text, author,
+//             date, views and image are read from Telegram's public post page
+//             and embed widget; videos are transcribed (direct file → Groq,
+//             yt-dlp fallback). t.me/s/ links normalized; private (t.me/c/)
+//             and channel-only links get clear errors. Actor research adds
+//             channel data (subscribers, verification, description with
+//             cross-platform handles, recent activity). Test hooks:
+//             TELEGRAM_BASE_URL, GROQ_API_URL (default to the real services).
+//
 // v2.0.5 — Per-scan model and Jev tracking: scoring results report the models
 //             used (judge / triage / translate); scans table gains jev_tokens
 //             and models columns; /history/save stores them (and fills the
@@ -332,7 +341,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '2.0.5';
+const SERVER_VERSION = '2.1.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -354,6 +363,8 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 // ─────────────────────────────────────────────
 const ANTHROPIC_URL      = process.env.ANTHROPIC_API_URL || 'https://api.anthropic.com/v1/messages';
 const TYPESAFE_URL       = process.env.TYPESAFE_API_URL || 'https://api.typesafe.ai/v1/systemone';
+const TELEGRAM_BASE      = process.env.TELEGRAM_BASE_URL || 'https://t.me';
+const GROQ_API_URL       = process.env.GROQ_API_URL || 'https://api.groq.com/openai/v1/audio/transcriptions';
 const TYPESAFE_API_KEY   = process.env.TYPESAFE_API_KEY || '';
 const JEV_MODEL          = process.env.JEV_MODEL || 'jev-1.13.0';      // pinned version (TypeSafe recommends pinning)
 const JEV_THRESHOLD      = parseFloat(process.env.JEV_THRESHOLD || '0.3');   // entity passes screening at/above this
@@ -1042,7 +1053,7 @@ app.post('/fetch-and-analyze', async (req, res) => {
   if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
   try {
     const platform = detectPlatform(url);
-    if (!platform) return res.status(400).json({ error: 'Unsupported URL. Paste a URL from X, Facebook, Instagram, TikTok, YouTube, or a supported news website.' });
+    if (!platform) return res.status(400).json({ error: 'Unsupported URL. Paste a URL from X, Facebook, Instagram, TikTok, YouTube, Telegram, or a news website.' });
     let postData;
 
     // Video platforms: try yt-dlp + Groq Whisper first
@@ -1070,6 +1081,7 @@ app.post('/fetch-and-analyze', async (req, res) => {
         if (!GROQ_API_KEY) throw new Error('TikTok requires GROQ_API_KEY on the server. Paste the caption manually instead.');
         throw new Error('Could not transcribe this TikTok video — it may be private, removed, or region-locked. Paste the caption manually instead.');
       }
+      else if (platform === 'telegram') postData = await fetchFromTelegram(url);
       else if (platform === 'news') postData = await fetchFromNews(url);
     }
 
@@ -1096,8 +1108,11 @@ app.post('/research-actor', async (req, res) => {
   try {
     const isNews = url && isNewsDomain(url);
     const domain = isNews ? extractDomain(url) : null;
+    const tg = url ? parseTelegramUrl(url) : null;
+    const tgInfo = (tg && tg.channel) ? await fetchTelegramChannelInfo(tg.channel) : null;
+    if (tgInfo) console.log(`[TELEGRAM] channel info @${tgInfo.channel}: ${JSON.stringify(tgInfo.counters)}${tgInfo.verified ? ' verified' : ''}`);
     const [actor, publication] = await Promise.all([
-      researchActorWithClaude(handle, url, isNews),
+      researchActorWithClaude(handle, url, isNews, formatTelegramChannelContext(tgInfo)),
       isNews ? researchPublicationWithClaude(domain) : Promise.resolve(null)
     ]);
     const actorTokens = (actor._tokens?.input || 0) + (publication?._tokens?.input || 0);
@@ -1668,6 +1683,7 @@ function detectPlatform(url) {
   if (/instagram\.com/i.test(url)) return 'instagram';
   if (/youtube\.com|youtu\.be/i.test(url)) return 'youtube';
   if (/tiktok\.com/i.test(url)) return 'tiktok';
+  if (parseTelegramUrl(url)) return 'telegram';
   if (isNewsDomain(url)) return 'news';
   // Fall back to news for any URL with an article-like path
   try {
@@ -1851,7 +1867,7 @@ async function fetchVideoTranscript(url) {
   }
 }
 
-const VIDEO_PLATFORM_NAMES = { tiktok: 'TikTok', instagram: 'Instagram', facebook: 'Facebook', x: 'X' };
+const VIDEO_PLATFORM_NAMES = { tiktok: 'TikTok', instagram: 'Instagram', facebook: 'Facebook', x: 'X', telegram: 'Telegram' };
 
 function buildVideoAnalysisText(video, platform) {
   const name = VIDEO_PLATFORM_NAMES[platform] || 'Video';
@@ -1865,6 +1881,172 @@ function buildVideoAnalysisText(video, platform) {
   if (video.tags && video.tags.length) parts.push('Hashtags: ' + video.tags.map(t => '#' + t).join(' '));
   parts.push(video.transcript ? ('Audio transcript: ' + video.transcript) : 'Audio transcript: (no usable speech detected — analyze from the caption only)');
   return parts.join('\n\n');
+}
+
+// ─────────────────────────────────────────────
+// TELEGRAM — public channel posts, read from Telegram's public web pages (no login)
+//   Layer 1: post page meta tags (text, channel name, image)
+//   Layer 2: embed widget (full formatting, date, views, video)
+//   Video: direct file → Groq Whisper; too big → yt-dlp fallback
+// ─────────────────────────────────────────────
+const TG_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36';
+
+function parseTelegramUrl(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.replace(/^www\./, '').toLowerCase();
+    if (host !== 't.me' && host !== 'telegram.me') return null;
+    const parts = u.pathname.split('/').filter(Boolean);
+    if (parts[0] === 's') parts.shift();                       // t.me/s/<channel>/<id>
+    if (parts[0] === 'c') return { private: true };            // t.me/c/<id>/<id> — private channel
+    if (parts.length >= 2 && /^[A-Za-z0-9_]{3,}$/.test(parts[0]) && /^\d+$/.test(parts[1])) return { channel: parts[0], postId: parts[1] };
+    if (parts.length === 1 && /^[A-Za-z0-9_]{3,}$/.test(parts[0])) return { channel: parts[0], postId: null };
+  } catch (_) {}
+  return null;
+}
+
+async function fetchTelegramHtml(path) {
+  const res = await fetch(TELEGRAM_BASE + path, { headers: { 'User-Agent': TG_UA, 'Accept-Language': 'en-US,en;q=0.9' }, redirect: 'follow' });
+  if (!res.ok) throw new Error('Telegram HTTP ' + res.status);
+  return await res.text();
+}
+
+function tgText($el) {
+  if (!$el || !$el.length) return '';
+  const clone = $el.clone();
+  clone.find('br').replaceWith('\n');
+  return clone.text().replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// Transcribe an audio/video buffer with Groq Whisper
+async function transcribeBuffer(bytes, ext) {
+  if (!GROQ_API_KEY || !bytes || !bytes.length) return null;
+  if (bytes.length > 25 * 1024 * 1024) { console.log('Audio exceeds Groq 25MB limit'); return null; }
+  const form = new FormData();
+  form.append('file', new Blob([bytes], { type: AUDIO_MIME[ext] || 'application/octet-stream' }), 'audio.' + (AUDIO_MIME[ext] ? ext : 'mp4'));
+  form.append('model', 'whisper-large-v3');
+  form.append('response_format', 'json');
+  const r = await globalThis.fetch(GROQ_API_URL, { method: 'POST', headers: { 'Authorization': 'Bearer ' + GROQ_API_KEY }, body: form });
+  if (!r.ok) { console.log('Groq error:', r.status, (await r.text()).slice(0, 300)); return null; }
+  const t = ((await r.json()).text || '').replace(/\s+/g, ' ').trim();
+  if (t.length < 20) return null;
+  const w = t.split(' ');
+  return w.length > 3000 ? w.slice(0, 3000).join(' ') + '...' : t;
+}
+
+// Download a direct video URL (Telegram CDN) and transcribe it
+async function transcribeUrl(src) {
+  try {
+    const res = await globalThis.fetch(src, { headers: { 'User-Agent': TG_UA } });
+    if (!res.ok) { console.log('[TELEGRAM] video download HTTP', res.status); return null; }
+    const len = parseInt(res.headers.get('content-length') || '0', 10);
+    if (len > 24 * 1024 * 1024) { console.log('[TELEGRAM] video too large to transcribe'); return null; }
+    const bytes = Buffer.from(await res.arrayBuffer());
+    const ext = (src.split('?')[0].split('.').pop() || 'mp4').toLowerCase();
+    return await transcribeBuffer(bytes, ext);
+  } catch (e) {
+    console.log('[TELEGRAM] video transcription failed:', e.message);
+    return null;
+  }
+}
+
+async function fetchFromTelegram(url) {
+  const p = parseTelegramUrl(url);
+  if (!p) throw new Error('Unrecognized Telegram link. Use a public channel post link, like t.me/channel/1234.');
+  if (p.private) throw new Error('This is a private Telegram channel — WBT can only read public channels. Paste the post text manually instead.');
+  if (!p.postId) throw new Error('This is a Telegram channel link, not a post. Open the specific post and copy its link (t.me/channel/1234).');
+
+  const postPath = `/${p.channel}/${p.postId}`;
+  const out = { source: 'telegram', domain: 't.me', authorHandle: p.channel, author: null, text: '', normalizedUrl: 'https://t.me' + postPath };
+  const layers = [];
+
+  // Layer 1 — post page meta tags
+  try {
+    const $ = cheerio.load(await fetchTelegramHtml(postPath));
+    out.text = ($('meta[property="og:description"]').attr('content') || '').trim();
+    out.author = ($('meta[property="og:title"]').attr('content') || '').trim() || null;
+    out.ogImage = $('meta[property="og:image"]').attr('content') || null;
+    if (out.text) layers.push('meta');
+  } catch (e) { console.log('[TELEGRAM] post page failed:', e.message); }
+
+  // Layer 2 — embed widget
+  let videoSrc = null, mediaTooBig = false;
+  try {
+    const $ = cheerio.load(await fetchTelegramHtml(postPath + '?embed=1&mode=tme'));
+    const msg = $('.tgme_widget_message').first();
+    if (msg.length) {
+      const t = tgText(msg.find('.tgme_widget_message_text').first());
+      if (t && t.length >= out.text.length * 0.8) out.text = t;   // embed keeps line breaks
+      const owner = msg.find('.tgme_widget_message_owner_name').first().text().trim();
+      if (owner) out.author = owner;
+      const dt = msg.find('time[datetime]').first().attr('datetime');
+      if (dt) out.publishedAt = dt;
+      const views = msg.find('.tgme_widget_message_views').first().text().trim();
+      if (views) out.views = views;
+      videoSrc = msg.find('video[src]').first().attr('src') || null;
+      mediaTooBig = /media is too big/i.test(msg.find('.message_media_not_supported_label, .message_media_not_supported').text());
+      if (!out.ogImage) {
+        const bg = (msg.find('.tgme_widget_message_photo_wrap, .tgme_widget_message_video_thumb').first().attr('style') || '').match(/url\(['"]?([^'")]+)/);
+        if (bg) out.ogImage = bg[1];
+      }
+      layers.push('embed');
+    }
+  } catch (e) { console.log('[TELEGRAM] embed failed:', e.message); }
+
+  const caption = out.text;
+  out.ogTitle = caption ? caption.split('\n')[0].slice(0, 120) : null;
+
+  // Video — direct file first, yt-dlp if Telegram withholds it
+  if (GROQ_API_KEY && (videoSrc || mediaTooBig)) {
+    let transcript = videoSrc ? await transcribeUrl(videoSrc) : null;
+    if (!transcript) {
+      const v = await fetchVideoTranscript(out.normalizedUrl);
+      if (v && v.transcript) transcript = v.transcript;
+    }
+    if (transcript) {
+      out.hasVideoTranscript = true;
+      out.text = buildVideoAnalysisText({ uploader: p.channel, caption, tags: [], transcript }, 'telegram');
+    } else {
+      out.videoNote = 'This post contains a video that could not be transcribed. Analysis is based on the post text only.';
+    }
+  }
+
+  console.log(`[TELEGRAM] @${p.channel}/${p.postId}: layers=${layers.join('+') || 'none'} | text=${caption.length} chars | video=${videoSrc ? 'direct' : mediaTooBig ? 'too big' : 'none'}${out.hasVideoTranscript ? ' (transcribed)' : ''}${out.views ? ' | views=' + out.views : ''}${out.publishedAt ? ' | ' + out.publishedAt : ''}`);
+  if (!out.text) throw new Error('Could not read this Telegram post. It may be deleted, or from a private channel.');
+  if (!out.hasVideoTranscript && (videoSrc || mediaTooBig) && caption.length < 30) {
+    throw new Error('This post is mainly a video that could not be transcribed' + (mediaTooBig ? ' (Telegram only shows smaller videos on the web)' : '') + ', and its caption is too short to analyze. Paste the video\'s transcript manually instead.');
+  }
+  return out;
+}
+
+// Public channel page → facts for actor research and bot detection
+async function fetchTelegramChannelInfo(channel) {
+  try {
+    const $ = cheerio.load(await fetchTelegramHtml('/s/' + channel));
+    const title = $('.tgme_channel_info_header_title').first().text().trim() || ($('meta[property="og:title"]').attr('content') || '').trim();
+    const description = tgText($('.tgme_channel_info_description').first()) || ($('meta[property="og:description"]').attr('content') || '').trim();
+    const counters = {};
+    $('.tgme_channel_info_counter').each((i, el) => {
+      const v = $(el).find('.counter_value').text().trim(), k = $(el).find('.counter_type').text().trim();
+      if (v && k) counters[k] = v;
+    });
+    const verified = $('.tgme_channel_info_header .verified-icon, .tgme_channel_info_header_title .verified-icon').length > 0;
+    const dates = $('.tgme_widget_message time[datetime]').map((i, el) => $(el).attr('datetime')).get().filter(Boolean).sort();
+    return { channel, title, description, counters, verified, recentPostsShown: dates.length, oldestShown: dates[0] || null, newestShown: dates[dates.length - 1] || null };
+  } catch (e) {
+    console.log('[TELEGRAM] channel info failed:', e.message);
+    return null;
+  }
+}
+
+function formatTelegramChannelContext(info) {
+  if (!info) return '';
+  const c = Object.entries(info.counters || {}).map(([k, v]) => `${v} ${k}`).join(', ');
+  return `Telegram channel data (read from the public channel page — treat as factual input):
+- Channel: ${info.title || info.channel} (@${info.channel})${info.verified ? ' — verified by Telegram' : ''}
+- ${c || 'Counters unavailable'}
+- Description: ${(info.description || 'none').slice(0, 800)}
+- Recent activity: ${info.recentPostsShown} recent posts shown${info.oldestShown ? `, from ${info.oldestShown} to ${info.newestShown}` : ''}`;
 }
 
 async function fetchFromNews(url) {
@@ -2894,7 +3076,7 @@ Respond ONLY with valid JSON:
   try { const result = extractJSON(raw); result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 }; return result; } catch(e) { return { name: domain, type: 'News website', agenda: 'Publication information not available.' }; }
 }
 
-async function researchActorWithClaude(handle, url, isNews) {
+async function researchActorWithClaude(handle, url, isNews, extraContext) {
   const context = isNews
     ? `This person is a journalist or contributor at a news publication. URL context: ${url || ''}`
     : `This is a social media account. ${url ? `Profile URL context: ${url}` : ''}`;
@@ -2902,7 +3084,7 @@ async function researchActorWithClaude(handle, url, isNews) {
   const prompt = `You are an open-source intelligence (OSINT) researcher. Research the following ${isNews ? 'journalist or public figure' : 'social media account'} and provide a factual profile.
 
 ${isNews ? `Name/byline: ${handle}` : `Account handle: @${handle}`}
-${context}
+${context}${extraContext ? '\n\n' + extraContext : ''}
 
 Provide:
 1. name: Full real name (if publicly known). If unknown, use the handle.
