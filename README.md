@@ -1,5 +1,36 @@
 # Who's Behind That? — Server Changelog
 
+### v2.0.5 (server) | Admin: v2.24.1 | Client: v1.19.0
+Live upgrade from v1.28.0. Consolidates v2.0.0–v2.0.5.
+
+New scoring engine — Jev screens, Claude judges
+- Hebrew and Arabic posts are translated to English (Haiku 4.5) before screening
+- Jev 1.13 (TypeSafe, via OpenRouter) screens all entities in one request with three literal questions per entity: mentioned, criticized, praised
+- Claude Opus 5.5 judges the shortlist in a single structured-output call, and receives a names-only list of all other entities so it can add unmentioned beneficiaries
+- Judge prompt includes score calibration anchors, adversarial-framing and quoted-clip rules; the final score is computed in code
+- Replaces batch scoring, Phase 2 enrichment and the coherence check
+- Cluster detection: Jev pre-screens post pairs; only likely connections reach Claude
+- Automatic fallback: without TYPESAFE_API_KEY, or if Jev fails, all entities go to the judge
+
+Models and reliability
+- All models configurable per task (Prompts tab / env vars); Sonnet 4.x deprecated and automatically replaced; no hardcoded models
+- Claude calls adapt to per-model restrictions (temperature, forced tool calls), remember them, and skip the failing attempt on later calls
+- Translation handles long articles
+
+Monitoring
+- Every Jev call is recorded server-side (new jev_usage table); /stats returns Jev tokens and calls
+- Each scan reports the models used; the scans table stores per-scan Jev tokens and models
+- Logs show translation status, Jev's top scores, and the judge's scores for every scan
+
+Fixes
+- Startup no longer fails on a brand-new empty database
+
+Deployment
+- New env vars: TYPESAFE_API_KEY, TYPESAFE_API_URL, JEV_MODEL (optional: CLAUDE_DEEP_MODEL, CLAUDE_DEFAULT_MODEL, CLAUDE_FAST_MODEL, JEV_THRESHOLD, JEV_MIN_SHORTLIST, JEV_MAX_SHORTLIST)
+- Database changes are additive and apply automatically on startup
+- package.json: version 2.0.5, Node 20+
+- Response format unchanged, but deploy client v1.19.0 and admin v2.24.1 alongside, so the new scores are displayed correctly
+
 ### v1.28.0 (server) | Admin: v2.20.0 | Client: v1.18.0
 - Video scans now include context: generic note on transcript limits (speech only, no on-screen text/visuals/speaker IDs; judge overall framing), plus creator caption, hashtags, and account — fetched in the same yt-dlp call at no extra cost
 - Caption-only fallback when a video has no usable speech
