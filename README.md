@@ -1,5 +1,12 @@
 # Who's Behind That? — Server Changelog
 
+### v2.1.0 (server) | Admin: v2.25.0 | Client: v1.20.0
+- Telegram support (public channels, no login): post text, author, date, views and image read from Telegram's public post page and embed widget
+- Telegram videos transcribed (direct file → Groq Whisper, yt-dlp fallback for larger videos)
+- Actor research adds Telegram channel data: verification, subscribers, media counts, description, recent activity
+- Clear errors for private channels, channel-only links, and untranscribable videos with too-short captions
+- t.me/s/ links normalized to post links
+
 ### v2.0.5 (server) | Admin: v2.24.1 | Client: v1.19.0
 Live upgrade from v1.28.0. Consolidates v2.0.0–v2.0.5.
 
