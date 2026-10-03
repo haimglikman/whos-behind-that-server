@@ -5,6 +5,12 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v2.3.0 — GET /system/info: single source of truth for the admin. Reports the
+//             models actually in use (resolved per task from env vars and the
+//             Prompts tab, grouped by model), which services are configured,
+//             and default prompt texts built from the live code (Judge). No
+//             secrets are exposed — only whether each key is set.
+//
 // v2.2.0 — Cluster analysis upgrade:
 //             1. Membership check: clusters of 3+ posts are reviewed (default
 //                model) so chained links can't merge unrelated narratives —
@@ -354,7 +360,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '2.2.0';
+const SERVER_VERSION = '2.3.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -1011,6 +1017,76 @@ app.get('/proxy-image', async (req, res) => {
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ─────────────────────────────────────────────
+// GET /system/info — single source of truth for the admin's
+// "Models used", "Tools & dependencies" and default prompts.
+// Reports what is ACTUALLY configured (env vars + Prompts tab), never secrets.
+// ─────────────────────────────────────────────
+const TASK_DESCRIPTIONS = {
+  deep_score:    { label: 'The judge: final alignment scores, primary/secondary verdict, and why/missing explanations', prompt: true },
+  translate:     { label: 'Translating Hebrew/Arabic posts to English for screening' },
+  connection:    { label: 'Cluster connection checks', prompt: true },
+  cluster_check: { label: 'Cluster membership check' },
+  synopsis:      { label: 'Cluster synopsis and connection reason', prompt: true },
+  actor:         { label: 'Actor research and bot detection', prompt: true },
+  convergent:    { label: 'Convergent interest', prompt: true },
+  entities:      { label: 'Entity refresh' },
+  websearch:     { label: 'Web-search post fetching' },
+  publication:   { label: 'Publication research' }
+};
+
+function modelEnvVar(id) {
+  if (id === DEEP_MODEL) return 'CLAUDE_DEEP_MODEL';
+  if (id === FAST_MODEL) return 'CLAUDE_FAST_MODEL';
+  if (id === DEFAULT_MODEL) return 'CLAUDE_DEFAULT_MODEL';
+  return null;
+}
+
+function buildSystemInfo() {
+  const models = [];
+  if (TYPESAFE_API_KEY) models.push({ id: JEV_MODEL, provider: 'TypeSafe', roles: ['Screening: finds which entities a post is about (mentioned, criticized, praised)', 'Pre-checks post pairs in cluster investigations'], config: 'JEV_MODEL' });
+  // Claude: group tasks by the model each one actually resolves to
+  const byModel = {};
+  Object.keys(TASK_DESCRIPTIONS).forEach(task => {
+    const id = getModel(task);
+    (byModel[id] = byModel[id] || []).push(task);
+  });
+  Object.entries(byModel).forEach(([id, tasks]) => {
+    const env = modelEnvVar(id);
+    const viaPrompts = tasks.some(t => TASK_DESCRIPTIONS[t].prompt && promptCache[t] && promptCache[t].model);
+    models.push({ id, provider: 'Anthropic', roles: tasks.map(t => TASK_DESCRIPTIONS[t].label), tasks, config: [env, viaPrompts ? 'Prompts tab' : null].filter(Boolean).join(' / ') || 'Prompts tab' });
+  });
+  if (GROQ_API_KEY) models.push({ id: 'whisper-large-v3', provider: 'Groq', roles: ['Transcribes video audio: TikTok, Instagram, Facebook, X, Telegram'], config: 'GROQ_API_KEY' });
+
+  const viaOpenRouter = /openrouter\.ai/i.test(TYPESAFE_URL);
+  const services = [
+    { group: 'Hosting & data', name: 'Render', purpose: 'Hosts the WBT server (Node.js / Express)', config: '—', active: true },
+    { group: 'Hosting & data', name: 'Neon PostgreSQL', purpose: 'Shared database: scans, clusters, actors, entities, prompts, FAQ, usage', config: 'DATABASE_URL', active: !!db },
+    { group: 'AI & transcription', name: 'Anthropic Claude API', purpose: 'Judging, translation, cluster analysis, actor research, bot detection', config: 'ANTHROPIC_API_KEY', active: !!ANTHROPIC_KEY },
+    { group: 'AI & transcription', name: viaOpenRouter ? 'TypeSafe Jev (via OpenRouter)' : 'TypeSafe Jev', purpose: 'Screening model for posts and cluster pairs', config: viaOpenRouter ? 'TYPESAFE_API_KEY, TYPESAFE_API_URL' : 'TYPESAFE_API_KEY', active: !!TYPESAFE_API_KEY },
+    { group: 'AI & transcription', name: 'Groq (Whisper)', purpose: 'Video transcription', config: 'GROQ_API_KEY', active: !!GROQ_API_KEY },
+    { group: 'AI & transcription', name: 'TranscriptAPI.com', purpose: 'YouTube transcripts', config: 'transcriptapi_API_KEY', active: !!TRANSCRIPT_API_KEY },
+    { group: 'AI & transcription', name: 'YouTube Data API v3 (Google Cloud)', purpose: 'YouTube video length and live-stream checks', config: 'YOUTUBE_API_KEY', active: !!YOUTUBE_API_KEY },
+    { group: 'Content access', name: 'yt-dlp (open source)', purpose: 'Downloads video audio and captions from TikTok, Instagram, Facebook, X, Telegram', config: '—', active: !!GROQ_API_KEY },
+    { group: 'Content access', name: 'Telegram public web pages', purpose: 'Public channel posts and channel details — no login', config: '—', active: true },
+    { group: 'Content access', name: 'X oEmbed (publish.twitter.com)', purpose: 'Fetches X post text', config: '—', active: true },
+    { group: 'Content access', name: 'Internet Archive (Wayback Machine)', purpose: 'Fallback for news articles that block direct access', config: '—', active: true },
+    { group: 'Libraries', name: 'npm: express, cors, node-fetch, cheerio, pg', purpose: 'Web server, CORS, HTTP requests, HTML parsing, PostgreSQL client', config: '—', active: true }
+  ];
+
+  // Default prompt texts with their ${placeholders}, built from the live code
+  const promptDefaults = {
+    deep_score: buildDeepPrompt('${postText}', '${entitySummaries}', '${otherEntities}')
+  };
+
+  return { version: SERVER_VERSION, models, services, promptDefaults };
+}
+
+app.get('/system/info', (req, res) => {
+  try { res.json(Object.assign({ success: true }, buildSystemInfo())); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/', (req, res) => {
