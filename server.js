@@ -5,6 +5,19 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v2.2.0 — Cluster analysis upgrade:
+//             1. Membership check: clusters of 3+ posts are reviewed (default
+//                model) so chained links can't merge unrelated narratives —
+//                the cluster is kept, split, or loses posts that don't fit.
+//             2. Richer post profiles: each post's own scan verdict and English
+//                "why" (from the DB) plus a 300-char excerpt replace the 150-char
+//                excerpt — for the Jev pair check, the connection check and the
+//                synopsis.
+//             3. Coordination evidence computed in code (near-identical wording,
+//                same account, shared links/hashtags, bot-flagged authors) feeds
+//                a one-sentence connection reason that now leads the synopsis.
+//             Posting time not used yet (only scan time is stored).
+//
 // v2.1.0 — Telegram support (public channels, no login). Post text, author,
 //             date, views and image are read from Telegram's public post page
 //             and embed widget; videos are transcribed (direct file → Groq,
@@ -341,7 +354,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '2.1.0';
+const SERVER_VERSION = '2.2.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -390,6 +403,7 @@ const promptCache = {
   websearch:  { model: null, text: null },
   entities:   { model: null, text: null },
   publication:{ model: null, text: null },
+  cluster_check:{ model: null, text: null },
   scan:       { model: null, text: null },   // legacy — not used by the v2 engine
   coherence:  { model: null, text: null }    // legacy — not used by the v2 engine
 };
@@ -1381,6 +1395,152 @@ app.patch('/history/comment', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+// CLUSTER ANALYSIS HELPERS (v2.2.0)
+//   Profiles:  each post's own scan result (verdict + English "why") from the DB
+//   Membership: clusters of 3+ posts are checked so chained links can't merge unrelated narratives
+//   Evidence:  concrete coordination clues computed in code (no tokens)
+// ─────────────────────────────────────────────
+function clipText(s, n) { return String(s || '').replace(/\s+/g, ' ').trim().slice(0, n); }
+
+// Account handle from the post URL, when the platform puts it there
+function handleFromUrl(url) {
+  const u = String(url || '');
+  let m = u.match(/(?:x|twitter)\.com\/([A-Za-z0-9_]{1,15})\/status\//i); if (m) return m[1].toLowerCase();
+  m = u.match(/tiktok\.com\/@([^\/?#]+)/i); if (m) return m[1].toLowerCase();
+  m = u.match(/(?:^|\/\/)(?:www\.)?(?:t|telegram)\.me\/(?:s\/)?([A-Za-z0-9_]{3,})\/\d+/i); if (m) return m[1].toLowerCase();
+  m = u.match(/youtube\.com\/@([^\/?#]+)/i); if (m) return m[1].toLowerCase();
+  return null;
+}
+
+// Pull each post's stored scan result → short English profile (falls back to what the client sent)
+async function loadClusterProfiles(posts) {
+  const profiles = {};
+  const ids = (posts || []).map(p => p.scanId).filter(Boolean);
+  let rows = {};
+  if (db && ids.length) {
+    try {
+      const r = await db.query('SELECT id, url, post_text, full_result FROM scans WHERE id = ANY($1::text[])', [ids]);
+      r.rows.forEach(row => { rows[row.id] = row; });
+    } catch (e) { console.warn('[CLUSTER] profile lookup failed:', e.message); }
+  }
+  (posts || []).forEach(p => {
+    const row = rows[p.scanId] || {};
+    const fr = row.full_result || null;
+    const ms = (fr && Array.isArray(fr.matches)) ? fr.matches : [];
+    const top = ms.find(m => m.alignment === 'primary') || ms[0] || null;
+    profiles[p.scanId] = {
+      url: p.url || row.url || '',
+      handle: handleFromUrl(p.url || row.url),
+      text: String(row.post_text || p.postText || ''),
+      serves: top ? `${top.name} (${top.pct != null ? top.pct + '%' : '?'}${top.alignment ? ', ' + top.alignment : ''})` : ((p.topMatches || []).slice(0, 2).join(', ') || 'none'),
+      why: top && top.why ? clipText(top.why, 300) : ''
+    };
+  });
+  return profiles;
+}
+
+// Check that every post in a 3+ post cluster shares ONE narrative; split or drop the rest
+async function validateClusters(clusters, connections, posts, profiles) {
+  const out = [];
+  for (const cluster of clusters) {
+    if (cluster.length < 3) { out.push(cluster); continue; }
+    const lines = cluster.map((id, i) => {
+      const p = posts.find(x => x.scanId === id) || {};
+      const pr = profiles[id] || {};
+      return `POST ${i + 1}: serves ${pr.serves || 'unknown'}${pr.why ? ' — ' + pr.why : ''} | "${clipText(pr.text || p.postText, 300)}"`;
+    }).join('\n');
+    const idx = id => cluster.indexOf(id) + 1;
+    const links = connections.filter(c => cluster.includes(c.postA) && cluster.includes(c.postB))
+      .map(c => `POST ${idx(c.postA)} ↔ POST ${idx(c.postB)}: ${c.connectionType || 'connected'} — ${clipText(c.reasoning, 160)}`).join('\n');
+    const prompt = `CLUSTER MEMBERSHIP CHECK — Who's Behind That? (Israeli-Palestinian conflict / Israeli politics)
+
+These posts were grouped because each is linked to at least one other. Linking can chain: A–B and B–C groups A with C even when A and C share nothing. Check whether they all push ONE shared, specific narrative.
+
+POSTS:
+${lines}
+
+CONFIRMED LINKS:
+${links}
+
+Return the correct grouping. Each group must have 2+ posts that genuinely share a specific narrative. A post that fits no group goes in "excluded". If all posts belong together, return one group with all of them.
+
+Respond ONLY with JSON: {"groups": [[1,2,3]], "excluded": [], "reason": "one short sentence"}`;
+    try {
+      const response = await claudeFetch(ANTHROPIC_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: getModel('cluster_check'), max_tokens: 600, temperature: 0, messages: [{ role: 'user', content: prompt }] })
+      });
+      if (!response.ok) throw new Error('API ' + response.status);
+      const data = await response.json();
+      const r = extractJSON(data.content.filter(c => c.type === 'text').map(c => c.text || '').join(''));
+      const seen = new Set();
+      const groups = (Array.isArray(r.groups) ? r.groups : []).map(g => (Array.isArray(g) ? g : [])
+        .map(n => cluster[parseInt(n, 10) - 1]).filter(id => id && !seen.has(id) && seen.add(id)))
+        .filter(g => g.length >= 2);
+      if (!groups.length) throw new Error('no valid groups returned');
+      groups.forEach(g => out.push(g));
+      const dropped = cluster.filter(id => !groups.some(g => g.includes(id)));
+      console.log(`[CLUSTER] ${cluster.length} posts → ${groups.map(g => g.length).join(' + ')}${dropped.length ? ', ' + dropped.length + ' excluded' : ''}${r.reason ? ' — ' + clipText(r.reason, 160) : ''}`);
+    } catch (e) {
+      console.warn('[CLUSTER] membership check failed — keeping cluster as is:', e.message);
+      out.push(cluster);
+    }
+  }
+  return out;
+}
+
+// Concrete coordination clues, computed in code. (Posting time isn't used: only scan time is stored.)
+function shingles(text) {
+  const words = String(text || '').toLowerCase().replace(/https?:\/\/\S+/g, ' ').replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(Boolean);
+  const set = new Set();
+  for (let i = 0; i + 2 < words.length; i++) set.add(words[i] + ' ' + words[i + 1] + ' ' + words[i + 2]);
+  return set;
+}
+function jaccard(a, b) {
+  if (!a.size || !b.size) return 0;
+  let inter = 0; a.forEach(x => { if (b.has(x)) inter++; });
+  return inter / (a.size + b.size - inter);
+}
+async function computeCoordinationEvidence(clusterPosts, profiles) {
+  const n = clusterPosts.length, ev = [];
+  const label = i => 'post ' + (i + 1);
+  const texts = clusterPosts.map(p => (profiles[p.scanId] && profiles[p.scanId].text) || p.postText || '');
+  const sh = texts.map(shingles);
+  // Near-identical / shared wording
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+    const s = jaccard(sh[i], sh[j]);
+    if (s >= 0.5) ev.push(`Near-identical wording in ${label(i)} and ${label(j)}`);
+    else if (s >= 0.2) ev.push(`Shared phrasing in ${label(i)} and ${label(j)}`);
+  }
+  // Same account
+  const byHandle = {};
+  clusterPosts.forEach((p, i) => { const h = profiles[p.scanId] && profiles[p.scanId].handle; if (h) (byHandle[h] = byHandle[h] || []).push(i); });
+  Object.entries(byHandle).forEach(([h, is]) => { if (is.length >= 2) ev.push(`Same account (@${h}) posted ${is.map(label).join(' and ')}`); });
+  // Shared links and hashtags
+  const shared = (re, kind) => {
+    const map = {};
+    texts.forEach((t, i) => new Set((t.match(re) || []).map(x => x.toLowerCase().replace(/[.,)]+$/, ''))).forEach(x => (map[x] = map[x] || []).push(i)));
+    Object.entries(map).forEach(([x, is]) => { if (is.length >= 2) ev.push(`Same ${kind} ${x} in ${is.map(label).join(' and ')}`); });
+  };
+  shared(/https?:\/\/[^\s"'<>]+/g, 'link');
+  shared(/#[\p{L}\p{N}_]{2,}/gu, 'hashtag');
+  // Authors flagged by earlier bot detection
+  const handles = Object.keys(byHandle);
+  if (db && handles.length) {
+    try {
+      const r = await db.query('SELECT handle, actor_data FROM actors WHERE lower(handle) = ANY($1::text[]) ORDER BY ts DESC', [handles]);
+      const done = new Set();
+      r.rows.forEach(row => {
+        const h = String(row.handle).toLowerCase(), bp = row.actor_data && parseInt(row.actor_data.botProbability, 10);
+        if (!done.has(h) && bp >= 60) { done.add(h); ev.push(`Account @${h} has a ${bp}% bot probability (earlier actor research)`); }
+      });
+    } catch (e) { console.warn('[CLUSTER] bot lookup failed:', e.message); }
+  }
+  return ev.slice(0, 12);
+}
+
 // POST /investigate/detect
 // ─────────────────────────────────────────────
 // Stage 1: for each pair of posts in the batch, detect whether a meaningful
@@ -1399,7 +1559,8 @@ app.post('/investigate/detect', async (req, res) => {
     }
 
     // v2.0: Jev pre-gate — only pairs that look connected go to Claude
-    const gate = await jevGatePairs(pairs);
+    const profiles = await loadClusterProfiles(posts);
+    const gate = await jevGatePairs(pairs, profiles);
     const pairsToCheck = gate.pairs;
 
     // Optimization 1: batch pairs — 4 pairs per Claude call instead of 1
@@ -1425,8 +1586,9 @@ app.post('/investigate/detect', async (req, res) => {
       const pairsText = batch.map(([a, bPost], idx) => {
         const aDate = a.ts ? new Date(a.ts).toISOString().slice(0,10) : '?';
         const bDate = bPost.ts ? new Date(bPost.ts).toISOString().slice(0,10) : '?';
-        const aExcerpt = safe(a.postText, 150);
-        const bExcerpt = safe(bPost.postText, 150);
+        const aProf = profiles[a.scanId] || {}, bProf = profiles[bPost.scanId] || {};
+        const aExcerpt = safe(aProf.text || a.postText, 300) + (aProf.why ? '" | why it aligns: "' + safe(aProf.why, 250) : '');
+        const bExcerpt = safe(bProf.text || bPost.postText, 300) + (bProf.why ? '" | why it aligns: "' + safe(bProf.why, 250) : '');
         const aAlign = safe((a.topMatches||[]).slice(0,2).join('+') || 'none', 80);
         const bAlign = safe((bPost.topMatches||[]).slice(0,2).join('+') || 'none', 80);
         return `PAIR ${idx+1}:\nA: [${aDate}] alignment=${aAlign} (${a.overallScore||0}%) | "${aExcerpt}"\nB: [${bDate}] alignment=${bAlign} (${bPost.overallScore||0}%) | "${bExcerpt}"`;
@@ -1519,7 +1681,8 @@ Respond ONLY with a JSON array, one object per pair, in order:
       clusterMap[root].push(id);
     });
 
-    const clusters = Object.values(clusterMap).filter(c => c.length > 1);
+    const rawClusters = Object.values(clusterMap).filter(c => c.length > 1);
+    const clusters = await validateClusters(rawClusters, connections, posts, profiles);
     const isolated = postIds.filter(id => !clusters.flat().includes(id));
 
     res.json({ success: true, connections, clusters, isolated, triage: gate.stats });
@@ -1544,12 +1707,15 @@ app.post('/investigate/synthesize', async (req, res) => {
         .toString('utf8').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
         .slice(0, max || 300).replace(/\n/g, ' ').trim();
     };
+    const profiles = await loadClusterProfiles(clusterPosts);
     const postsText = clusterPosts.map((p, i) => {
       const date = p.ts ? new Date(p.ts).toISOString().slice(0,10) : '?';
-      const excerpt = safe3(p.postText, 300);
-      const alignment = safe3((p.topMatches||[]).slice(0,2).join('+') || 'none', 80);
-      return `POST ${i+1} [${date}] alignment=${alignment} (${p.overallScore||0}%): "${excerpt}"`;
+      const pr = profiles[p.scanId] || {};
+      const excerpt = safe3(pr.text || p.postText, 400);
+      const alignment = safe3(pr.serves || (p.topMatches||[]).slice(0,2).join('+') || 'none', 120);
+      return `POST ${i+1} [${date}] alignment=${alignment} (${p.overallScore||0}%): "${excerpt}"` + (pr.why ? `\n   Why it aligns: ${safe3(pr.why, 300)}` : '');
     }).join('\n\n');
+    const evidence = await computeCoordinationEvidence(clusterPosts, profiles);
 
     const prompt = `Narrative analyst for Who's Behind That? (Israeli-Palestinian conflict / Israeli politics).
 
@@ -1569,16 +1735,29 @@ Respond ONLY with valid JSON:
 }`;
 
     const dbSynopsisPrompt = getPrompt('synopsis');
-    const finalSynopsisPrompt = dbSynopsisPrompt ? interpolatePrompt(dbSynopsisPrompt, { postsText, 'clusterPosts.length': String(clusterPosts.length) }) : prompt;
+    const evidenceBlock = `
+
+COORDINATION EVIDENCE (computed from the posts — factual):
+${evidence.length ? evidence.map(e => '- ' + e).join('\n') : '- None found. The connection is by narrative only.'}
+
+In addition to the fields above, include "connectionReason": ONE short sentence (max 25 words) saying why these posts are connected — the shared claim or framing, plus any concrete evidence listed above. Never claim coordination beyond this evidence.`;
+    const finalSynopsisPrompt = (dbSynopsisPrompt ? interpolatePrompt(dbSynopsisPrompt, { postsText, 'clusterPosts.length': String(clusterPosts.length) }) : prompt) + evidenceBlock;
     const response = await claudeFetch(ANTHROPIC_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: getModel('synopsis'), max_tokens: 900, temperature: 0, messages: [{ role: 'user', content: finalSynopsisPrompt }] })
+      body: JSON.stringify({ model: getModel('synopsis'), max_tokens: 1100, temperature: 0, messages: [{ role: 'user', content: finalSynopsisPrompt }] })
     });
     if (!response.ok) throw new Error(`API error: ${response.status}`);
     const data = await response.json();
     const raw = data.content.filter(c => c.type === 'text').map(c => c.text || '').join('').trim();
     const result = extractJSON(raw);
+    result.evidence = evidence;
+    if (result.connectionReason) {
+      result.connectionReason = String(result.connectionReason).trim();
+      // Lead the synopsis with the one-line reason — shown everywhere the synopsis is (admin, client, carousel)
+      result.synopsis = result.connectionReason + (result.synopsis ? ' ' + result.synopsis : '');
+    }
+    console.log(`[CLUSTER] synopsis: ${evidence.length} evidence clue(s)${result.connectionReason ? ' | reason: ' + result.connectionReason : ''}`);
     result.postIds = cluster;
     result._tokens = { input: data.usage?.input_tokens || 0, output: data.usage?.output_tokens || 0 };
     res.json({ success: true, synthesis: result });
@@ -2893,15 +3072,20 @@ async function scoreWithClaude(postText, entities) {
 }
 
 // ── Cluster detection: Jev pre-screens post pairs ──
-async function jevGatePairs(pairs) {
+async function jevGatePairs(pairs, profiles) {
   if (!TYPESAFE_API_KEY || pairs.length < 2) return { pairs, stats: { used: false, total: pairs.length } };
   try {
     const clip = (s, n) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, n);
-    const side = p => ({
-      date: p.ts ? new Date(p.ts).toISOString().slice(0, 10) : 'unknown',
-      aligned_with: (p.topMatches || []).slice(0, 2).join(', ') || 'none',
-      text: clip(p.postText, 400)
-    });
+    const side = p => {
+      const pr = (profiles && profiles[p.scanId]) || {};
+      const s = {
+        date: p.ts ? new Date(p.ts).toISOString().slice(0, 10) : 'unknown',
+        aligned_with: pr.serves || (p.topMatches || []).slice(0, 2).join(', ') || 'none',
+        text: clip(pr.text || p.postText, 400)
+      };
+      if (pr.why) s.summary_in_english = clip(pr.why, 300);   // English — Jev's strongest language
+      return s;
+    };
     const questions = {};
     pairs.forEach(([a, b], i) => {
       questions['c' + i] = {
