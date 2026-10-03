@@ -1,5 +1,10 @@
 # Who's Behind That? — Server Changelog
 
+### v2.2.0 (server) | Admin: v2.25.1 | Client: v1.20.0
+- Cluster membership check: clusters of 3+ posts are reviewed so chained links can't merge unrelated narratives — posts that don't fit are excluded or split into their own cluster
+- Richer connection checks: each post's own scan verdict and English explanation replace the 150-character excerpt (Jev pair check, connection check, synopsis)
+- Coordination evidence computed in code (near-identical wording, same account, shared links and hashtags, bot-flagged authors) feeds a one-sentence connection reason that now leads the cluster synopsis
+
 ### v2.1.0 (server) | Admin: v2.25.0 | Client: v1.20.0
 - Telegram support (public channels, no login): post text, author, date, views and image read from Telegram's public post page and embed widget
 - Telegram videos transcribed (direct file → Groq Whisper, yt-dlp fallback for larger videos)
