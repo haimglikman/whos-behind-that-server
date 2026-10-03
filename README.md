@@ -1,5 +1,8 @@
 # Who's Behind That? — Server Changelog
 
+### v2.3.0 (server) | Admin: v2.26.0 | Client: v1.20.0
+- New GET /system/info: reports the models actually in use (per task, from env vars and the Prompts tab), which services are configured, and default prompt texts built from the live code — no secrets exposed
+
 ### v2.2.0 (server) | Admin: v2.25.1 | Client: v1.20.0
 - Cluster membership check: clusters of 3+ posts are reviewed so chained links can't merge unrelated narratives — posts that don't fit are excluded or split into their own cluster
 - Richer connection checks: each post's own scan verdict and English explanation replace the 150-character excerpt (Jev pair check, connection check, synopsis)
