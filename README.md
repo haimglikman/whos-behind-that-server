@@ -1,5 +1,13 @@
 # Who's Behind That? — Server Changelog
 
+### v2.7.0 (server) | Admin: v2.30.0 | Client: v1.20.0 | Chatbot: v1.2.0
+- Chatbot log: new chatbot_log table (created automatically) storing each question and answer from wbt-chatbot with sources, status, chatbot version, model, tokens and latency
+- POST /chatbot/log: authenticated with the X-Chatbot-Key header matching the new CHATBOT_LOG_KEY env var (separate from ADMIN_KEY, no admin rights)
+- GET /chatbot/list (admin-only): latest entries plus totals (questions, sessions, last 7 days, failed, token sums)
+- /system/info lists the chatbot log key status
+- package.json: version 2.7.0
+- Docs: ARCHITECTURE.md v1.1.0
+
 ### v2.6.0 (server) | Admin: v2.29.0 | Client: v1.20.0 | Chatbot: v1.0.0
 Built from v2.3.0 (v2.4.x–v2.5.x were dev-only).
 - Security: operator endpoints now require the X-Admin-Key header matching the new ADMIN_KEY env var — prompt, entity and FAQ writes, entity refresh, scan comments, and all-user reads (history, actors, client sessions, stats, prompt history, unscoped cluster list). Refused while ADMIN_KEY is unset
