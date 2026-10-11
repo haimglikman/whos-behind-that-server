@@ -1,5 +1,15 @@
 # Who's Behind That? — Server Changelog
 
+### v2.6.0 (server) | Admin: v2.29.0 | Client: v1.20.0 | Chatbot: v1.0.0
+Built from v2.3.0 (v2.4.x–v2.5.x were dev-only).
+- Security: operator endpoints now require the X-Admin-Key header matching the new ADMIN_KEY env var — prompt, entity and FAQ writes, entity refresh, scan comments, and all-user reads (history, actors, client sessions, stats, prompt history, unscoped cluster list). Refused while ADMIN_KEY is unset
+- Server-side daily quotas (UTC days): 10 scans per device and 30 per IP across /analyze, /fetch-and-analyze and /research-actor (successful scans only); 20 investigation calls per IP across /investigate/* and /convergent-interest. Admin requests are exempt
+- New usage_quota table (created automatically; device IDs and IPs stored hashed; rows older than 7 days pruned on startup)
+- /system/info lists the admin key status (set / not set, never the value)
+- package.json: version 2.6.0
+- Deployment: set ADMIN_KEY on Render before deploying; deploy admin v2.29.0 alongside
+- Docs: ARCHITECTURE.md v1.0.1, SERVER_DECISIONS.md v1.1.0
+
 ### v2.3.0 (server) | Admin: v2.26.0 | Client: v1.20.0
 - New GET /system/info: reports the models actually in use (per task, from env vars and the Prompts tab), which services are configured, and default prompt texts built from the live code — no secrets exposed
 
