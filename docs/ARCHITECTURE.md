@@ -1,6 +1,6 @@
 # Who's Behind That? — Architecture
 
-**Doc version:** 1.0.1 · Reflects server v2.6.0 · admin v2.29.0 · client v1.20.0
+**Doc version:** 1.1.0 · Reflects server v2.7.0 · admin v2.30.0 · client v1.20.0 · chatbot v1.2.0
 
 Who's Behind That? (WBT) is an AI-powered narrative alignment analysis tool. Given a social media post or news article, it identifies whose agenda the content serves — and, across multiple posts, whether they form a coordinated narrative. It focuses on the Israeli-Palestinian conflict and Israeli domestic politics, and is designed and built by a single developer.
 
@@ -10,7 +10,7 @@ Live at [whosbehindthat.com](https://whosbehindthat.com).
 
 | Doc | Covers |
 |---|---|
-| This file | The whole system: components, pipelines, data model, environments |
+| This document | The whole system: components, pipelines, data model, environments |
 | [Server decisions](SERVER_DECISIONS.md) | Scoring engine, fetching, transcription, clustering, versioning |
 | [Client overview](https://github.com/haimglikman/whos-behind-that-client/blob/main/docs/CLIENT_OVERVIEW.md) · [decisions](https://github.com/haimglikman/whos-behind-that-client/blob/main/docs/CLIENT_DECISIONS.md) | The public app |
 | [Admin overview](https://github.com/haimglikman/whos-behind-that-admin/blob/main/docs/ADMIN_OVERVIEW.md) · [decisions](https://github.com/haimglikman/whos-behind-that-admin/blob/main/docs/ADMIN_DECISIONS.md) | The operator console |
@@ -44,6 +44,7 @@ flowchart LR
 | Client | `whos-behind-that-client` | GitHub Pages (custom domain) | Public app: scan posts, research actors, investigate clusters, FAQ |
 | Admin | `whos-behind-that-admin` | GitHub Pages | Operator console: all users' data, entity database, prompts, models, FAQ editor, stats, Instagram carousel generator |
 | Server | `whos-behind-that-server` | Render | Fetching, translation, AI scoring, cluster detection, persistence |
+| Chatbot | `wbt-chatbot` | Render (API) + GitHub Pages ([ask.whosbehindthat.com](https://ask.whosbehindthat.com)) | Answers questions about how WBT was built, grounded in these repos' docs and changelogs; logs each exchange to the server |
 | Database | — | Neon (serverless PostgreSQL) | Scans, clusters, actors, entities, prompts, FAQ, usage |
 
 Each frontend is a single self-contained HTML file with no build step. The server is a single ES-module `server.js` with five npm dependencies (`express`, `cors`, `pg`, `cheerio`, `node-fetch`).
@@ -94,6 +95,7 @@ If Jev is unavailable, every entity goes straight to the judge.
 | `client_sessions` | Client versions per device |
 | `jev_usage` | Jev calls and tokens |
 | `usage_quota` | Daily usage counters per hashed device ID and IP |
+| `chatbot_log` | Questions and answers from the chatbot, with sources, status, version, tokens and latency |
 
 Schema changes are additive and apply automatically on startup.
 

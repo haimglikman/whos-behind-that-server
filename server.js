@@ -5,6 +5,12 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v2.7.0 — Chatbot log: new chatbot_log table. POST /chatbot/log stores each
+//             question and answer from wbt-chatbot (authenticated with the
+//             X-Chatbot-Key header matching CHATBOT_LOG_KEY — a separate key
+//             with no admin rights). GET /chatbot/list (admin-only) returns
+//             the log with totals for the admin Chatbot tab.
+//
 // v2.6.0 — Security: operator endpoints (prompt/entity/FAQ writes, entity
 //             refresh, scan comments, and all-user reads: history, actors,
 //             sessions, stats, prompt history, unscoped cluster list) now
@@ -371,7 +377,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '2.6.0';
+const SERVER_VERSION = '2.7.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -581,6 +587,7 @@ const ADMIN_ONLY = [
   ['GET',    /^\/actors\/list$/],
   ['GET',    /^\/client\/sessions$/],
   ['GET',    /^\/stats$/],
+  ['GET',    /^\/chatbot\/list$/],
 ];
 
 function requiresAdmin(req) {
@@ -763,6 +770,22 @@ async function initDB() {
         tokens INTEGER NOT NULL DEFAULT 0,
         questions INTEGER NOT NULL DEFAULT 0,
         model TEXT
+      );
+      CREATE TABLE IF NOT EXISTS chatbot_log (
+        id SERIAL PRIMARY KEY,
+        ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        session_id TEXT,
+        question TEXT NOT NULL,
+        answer TEXT,
+        status TEXT NOT NULL DEFAULT 'answered',
+        sources JSONB,
+        chatbot_version TEXT,
+        model TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        cache_read_tokens INTEGER,
+        cache_write_tokens INTEGER,
+        latency_ms INTEGER
       );
       CREATE TABLE IF NOT EXISTS usage_quota (
         bucket TEXT NOT NULL,
@@ -1188,6 +1211,7 @@ function buildSystemInfo() {
   const services = [
     { group: 'Hosting & data', name: 'Render', purpose: 'Hosts the WBT server (Node.js / Express)', config: '—', active: true },
     { group: 'Hosting & data', name: 'Neon PostgreSQL', purpose: 'Shared database: scans, clusters, actors, entities, prompts, FAQ, usage', config: 'DATABASE_URL', active: !!db },
+    { group: 'Hosting & data', name: 'Chatbot log key', purpose: 'Lets wbt-chatbot store its questions and answers for the admin Chatbot tab (no admin rights)', config: 'CHATBOT_LOG_KEY', active: !!CHATBOT_LOG_KEY },
     { group: 'Hosting & data', name: 'Admin key', purpose: 'Protects operator endpoints (writes and all-user data); admin requests are exempt from daily quotas', config: 'ADMIN_KEY', active: !!ADMIN_KEY },
     { group: 'AI & transcription', name: 'Anthropic Claude API', purpose: 'Judging, translation, cluster analysis, actor research, bot detection', config: 'ANTHROPIC_API_KEY', active: !!ANTHROPIC_KEY },
     { group: 'AI & transcription', name: viaOpenRouter ? 'TypeSafe Jev (via OpenRouter)' : 'TypeSafe Jev', purpose: 'Screening model for posts and cluster pairs', config: viaOpenRouter ? 'TYPESAFE_API_KEY, TYPESAFE_API_URL' : 'TYPESAFE_API_KEY', active: !!TYPESAFE_API_KEY },
@@ -3612,6 +3636,72 @@ function extractJSON(text) {
 }
 
 function stripHtml(html) { return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(); }
+
+// ─────────────────────────────────────────────
+// CHATBOT LOG — questions and answers from wbt-chatbot
+// ─────────────────────────────────────────────
+const CHATBOT_LOG_KEY = process.env.CHATBOT_LOG_KEY || '';
+
+function isChatbot(req) {
+  const given = req.get('X-Chatbot-Key') || '';
+  if (!CHATBOT_LOG_KEY || !given) return false;
+  const a = crypto.createHash('sha256').update(given).digest();
+  const b = crypto.createHash('sha256').update(CHATBOT_LOG_KEY).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+const clip = (v, n) => (typeof v === 'string' ? v.slice(0, n) : null);
+const int = v => (Number.isFinite(v) ? Math.round(v) : null);
+
+// POST /chatbot/log — called by wbt-chatbot after each question
+app.post('/chatbot/log', async (req, res) => {
+  if (!CHATBOT_LOG_KEY) return res.status(503).json({ error: 'CHATBOT_LOG_KEY is not configured on the server' });
+  if (!isChatbot(req)) return res.status(401).json({ error: 'Chatbot key required' });
+  if (!db) return res.status(503).json({ error: 'Database not configured' });
+  const b = req.body || {};
+  const question = clip(b.question, 2000);
+  if (!question) return res.status(400).json({ error: 'question required' });
+  try {
+    await db.query(
+      `INSERT INTO chatbot_log (session_id, question, answer, status, sources, chatbot_version, model,
+         input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, latency_ms)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [clip(b.sessionId, 64), question, clip(b.answer, 20000), clip(b.status, 32) || 'answered',
+       Array.isArray(b.sources) ? JSON.stringify(b.sources.slice(0, 30)) : null,
+       clip(b.chatbotVersion, 32), clip(b.model, 64),
+       int(b.inputTokens), int(b.outputTokens), int(b.cacheReadTokens), int(b.cacheWriteTokens), int(b.latencyMs)]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('chatbot/log error:', err.message);
+    res.status(500).json({ error: 'Failed to store log entry' });
+  }
+});
+
+// GET /chatbot/list — admin-only: latest entries plus totals
+app.get('/chatbot/list', async (req, res) => {
+  if (!db) return res.json({ success: true, entries: [], totals: {} });
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 300, 1), 1000);
+  try {
+    const [rows, totals] = await Promise.all([
+      db.query(`SELECT id, ts, session_id, question, answer, status, sources, chatbot_version, model,
+                       input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, latency_ms
+                FROM chatbot_log ORDER BY ts DESC LIMIT $1`, [limit]),
+      db.query(`SELECT COUNT(*)::int AS questions,
+                       COUNT(DISTINCT session_id)::int AS sessions,
+                       COUNT(*) FILTER (WHERE ts > NOW() - INTERVAL '7 days')::int AS last7d,
+                       COUNT(*) FILTER (WHERE status <> 'answered')::int AS failed,
+                       COALESCE(SUM(input_tokens),0)::bigint AS input_tokens,
+                       COALESCE(SUM(output_tokens),0)::bigint AS output_tokens,
+                       COALESCE(SUM(cache_read_tokens),0)::bigint AS cache_read_tokens,
+                       COALESCE(SUM(cache_write_tokens),0)::bigint AS cache_write_tokens
+                FROM chatbot_log`),
+    ]);
+    res.json({ success: true, entries: rows.rows, totals: totals.rows[0] });
+  } catch (err) {
+    console.error('chatbot/list error:', err.message);
+    res.status(500).json({ error: 'Failed to load chatbot log' });
+  }
+});
 
 // ─────────────────────────────────────────────
 // START
