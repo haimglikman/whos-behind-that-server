@@ -10,6 +10,8 @@ Built from v2.3.0 (v2.4.x–v2.5.x were dev-only).
 - Deployment: set ADMIN_KEY on Render before deploying; deploy admin v2.29.0 alongside
 - Docs: ARCHITECTURE.md v1.0.1, SERVER_DECISIONS.md v1.1.0
 
+### v2.4.x and v2.5.x deprecated DEV
+
 ### v2.3.0 (server) | Admin: v2.26.0 | Client: v1.20.0
 - New GET /system/info: reports the models actually in use (per task, from env vars and the Prompts tab), which services are configured, and default prompt texts built from the live code — no secrets exposed
 
