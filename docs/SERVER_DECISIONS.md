@@ -1,5 +1,7 @@
 # Who's Behind That? — Engineering Decisions
 
+**Doc version:** 1.1.0 · Reflects server v2.6.0 · admin v2.29.0 · client v1.20.0
+
 Key decisions behind WBT, in chronological order. Each entry covers the problem, what was tried, what was chosen, and the result. Version numbers refer to the component changelogs.
 
 ---
@@ -103,7 +105,6 @@ Key decisions behind WBT, in chronological order. Each entry covers the problem,
 
 **Outcome:** Features can be explored and dropped without touching production. Comment alignment, for example, was built in dev and never shipped.
 
-<!-- Haim: add the one-line reason comment alignment was dropped, if you want it public. -->
 
 ---
 
@@ -163,3 +164,19 @@ Key decisions behind WBT, in chronological order. Each entry covers the problem,
 - Discarded or never-deployed versions are marked as such in the changelog.
 
 **Outcome:** Any scan, bug report or deployment can be traced to an exact combination of client, admin and server.
+
+---
+
+## 14. Protect operator endpoints and enforce quotas on the server
+**Server v2.6.0 · Admin v2.29.0**
+
+**Problem:** The frontends are static pages and all three repos are public, so every server endpoint is visible. Anyone could call the write endpoints directly to change prompts, entities or the FAQ, or download every user's scan history. The 10-scans-a-day limit was enforced only in the browser, so direct API calls had no cost ceiling. CORS didn't help, because it only restricts browsers.
+
+**Decision:**
+- Operator endpoints require an `X-Admin-Key` header matching the `ADMIN_KEY` environment variable, compared in constant time. That covers writes, AI-cost operator actions, and reads that expose all users' data. If the variable is missing, those endpoints refuse every request rather than running unprotected.
+- The admin page asks for the key once and keeps it in that browser only, never in the public HTML. A small fetch interceptor attaches it to every request to the WBT server.
+- Daily quotas move to the server, stored in a `usage_quota` table so they survive restarts: 10 scans per device and 30 per IP (the IP cap catches device-ID resets), with only successful scans counted, plus 20 investigation calls per IP. Device IDs and IPs are stored hashed. Admin requests are exempt.
+- All of this lives in two middleware functions in one place, so no route handler changed and the client needed no update.
+
+**Outcome:** The public API now does only what the public client needs. Operator actions need the key, and AI spend has a hard ceiling per device and per IP.
+

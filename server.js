@@ -5,6 +5,17 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v2.6.0 — Security: operator endpoints (prompt/entity/FAQ writes, entity
+//             refresh, scan comments, and all-user reads: history, actors,
+//             sessions, stats, prompt history, unscoped cluster list) now
+//             require the X-Admin-Key header matching ADMIN_KEY. Fails closed
+//             when ADMIN_KEY is not set.
+//           Server-side daily quotas (new usage_quota table, UTC days):
+//             10 scans per device and 30 per IP across /analyze,
+//             /fetch-and-analyze and /research-actor (successful calls only);
+//             20 investigation calls per IP. Admin requests are exempt.
+//             Device IDs and IPs are stored hashed.
+//
 // v2.3.0 — GET /system/info: single source of truth for the admin. Reports the
 //             models actually in use (resolved per task from env vars and the
 //             Prompts tab, grouped by model), which services are configured,
@@ -360,13 +371,14 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '2.3.0';
+const SERVER_VERSION = '2.6.0';
 
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 import * as cheerio from 'cheerio';
 import pg from 'pg';
+import crypto from 'crypto';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import nodeFs from 'fs';
@@ -540,6 +552,110 @@ app.use(cors({
   }
 }));
 app.use(express.json({ limit: '2mb' }));
+app.set('trust proxy', 1);   // Render's proxy sets X-Forwarded-For — req.ip is the real client IP
+
+// ─────────────────────────────────────────────
+// ACCESS CONTROL — operator endpoints require X-Admin-Key
+// ─────────────────────────────────────────────
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+
+function isAdmin(req) {
+  const given = req.get('X-Admin-Key') || '';
+  if (!ADMIN_KEY || !given) return false;
+  const a = crypto.createHash('sha256').update(given).digest();
+  const b = crypto.createHash('sha256').update(ADMIN_KEY).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+// Writes, AI-cost operator actions, and reads that expose every user's data.
+const ADMIN_ONLY = [
+  ['POST',   /^\/faq\/save$/],
+  ['DELETE', /^\/faq\/[^/]+$/],
+  ['POST',   /^\/prompts\/save$/],
+  ['POST',   /^\/prompts\/activate\/[^/]+$/],
+  ['GET',    /^\/prompts\/history\/[^/]+$/],
+  ['POST',   /^\/entities\/save$/],
+  ['POST',   /^\/entities\/refresh$/],
+  ['PATCH',  /^\/history\/comment$/],
+  ['GET',    /^\/history\/list$/],
+  ['GET',    /^\/actors\/list$/],
+  ['GET',    /^\/client\/sessions$/],
+  ['GET',    /^\/stats$/],
+];
+
+function requiresAdmin(req) {
+  if (ADMIN_ONLY.some(([m, re]) => m === req.method && re.test(req.path))) return true;
+  // The client lists only its own clusters (device_id); the unscoped list is admin-only.
+  if (req.method === 'GET' && req.path === '/clusters/list' && !req.query.device_id) return true;
+  return false;
+}
+
+app.use((req, res, next) => {
+  if (!requiresAdmin(req)) return next();
+  if (!ADMIN_KEY) return res.status(503).json({ error: 'ADMIN_KEY is not configured on the server' });
+  if (!isAdmin(req)) return res.status(401).json({ error: 'Admin key required' });
+  next();
+});
+
+// ─────────────────────────────────────────────
+// QUOTAS — daily limits enforced server-side (UTC days)
+// ─────────────────────────────────────────────
+const QUOTAS = {
+  scan:        { paths: ['/analyze', '/fetch-and-analyze', '/research-actor'], perDevice: 10, perIp: 30, countOn: 'success' },
+  investigate: { paths: ['/investigate/detect', '/investigate/synthesize', '/convergent-interest'], perIp: 20, countOn: 'request' },
+};
+const memQuota = new Map();   // fallback when the DB is unavailable
+
+function hashId(value) { return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 24); }
+function utcDay() { return new Date().toISOString().slice(0, 10); }
+
+async function getUsage(bucket, subject) {
+  if (db) {
+    const r = await db.query(`SELECT count FROM usage_quota WHERE bucket=$1 AND subject=$2 AND day=$3`, [bucket, subject, utcDay()]);
+    return r.rows[0]?.count || 0;
+  }
+  return memQuota.get(`${bucket}|${subject}|${utcDay()}`) || 0;
+}
+
+async function addUsage(bucket, subject) {
+  if (db) {
+    await db.query(
+      `INSERT INTO usage_quota (bucket, subject, day, count) VALUES ($1,$2,$3,1)
+       ON CONFLICT (bucket, subject, day) DO UPDATE SET count = usage_quota.count + 1`,
+      [bucket, subject, utcDay()]);
+    return;
+  }
+  const k = `${bucket}|${subject}|${utcDay()}`;
+  memQuota.set(k, (memQuota.get(k) || 0) + 1);
+}
+
+app.use(async (req, res, next) => {
+  if (req.method !== 'POST') return next();
+  const kind = Object.keys(QUOTAS).find(k => QUOTAS[k].paths.includes(req.path));
+  if (!kind || isAdmin(req)) return next();
+  const q = QUOTAS[kind];
+  const subjects = [];
+  if (q.perDevice && req.body?.deviceId) subjects.push({ bucket: `${kind}:device`, subject: hashId(req.body.deviceId), limit: q.perDevice });
+  if (q.perIp) subjects.push({ bucket: `${kind}:ip`, subject: hashId(req.ip), limit: q.perIp });
+  try {
+    for (const s of subjects) {
+      if (await getUsage(s.bucket, s.subject) >= s.limit) {
+        const msg = kind === 'scan'
+          ? `Daily limit reached — ${q.perDevice} scans per device per day. Credits reset at midnight (UTC).`
+          : 'Daily investigation limit reached. Please try again tomorrow.';
+        return res.status(429).json({ error: msg });
+      }
+    }
+  } catch (err) {
+    console.error('Quota check failed (allowing request):', err.message);
+    return next();
+  }
+  const record = () => Promise.all(subjects.map(s => addUsage(s.bucket, s.subject)))
+    .catch(err => console.error('Quota record failed:', err.message));
+  if (q.countOn === 'request') record();
+  else res.on('finish', () => { if (res.statusCode < 400) record(); });
+  next();
+});
 
 // ── Auto-create scans table on startup
 async function initDB() {
@@ -648,7 +764,15 @@ async function initDB() {
         questions INTEGER NOT NULL DEFAULT 0,
         model TEXT
       );
+      CREATE TABLE IF NOT EXISTS usage_quota (
+        bucket TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        day DATE NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bucket, subject, day)
+      );
     `);
+    await db.query(`DELETE FROM usage_quota WHERE day < CURRENT_DATE - 7`);
     // Seed default FAQs if table is empty
     const faqCount = await db.query(`SELECT COUNT(*) FROM faq`);
     if (parseInt(faqCount.rows[0].count) === 0) {
@@ -1064,6 +1188,7 @@ function buildSystemInfo() {
   const services = [
     { group: 'Hosting & data', name: 'Render', purpose: 'Hosts the WBT server (Node.js / Express)', config: '—', active: true },
     { group: 'Hosting & data', name: 'Neon PostgreSQL', purpose: 'Shared database: scans, clusters, actors, entities, prompts, FAQ, usage', config: 'DATABASE_URL', active: !!db },
+    { group: 'Hosting & data', name: 'Admin key', purpose: 'Protects operator endpoints (writes and all-user data); admin requests are exempt from daily quotas', config: 'ADMIN_KEY', active: !!ADMIN_KEY },
     { group: 'AI & transcription', name: 'Anthropic Claude API', purpose: 'Judging, translation, cluster analysis, actor research, bot detection', config: 'ANTHROPIC_API_KEY', active: !!ANTHROPIC_KEY },
     { group: 'AI & transcription', name: viaOpenRouter ? 'TypeSafe Jev (via OpenRouter)' : 'TypeSafe Jev', purpose: 'Screening model for posts and cluster pairs', config: viaOpenRouter ? 'TYPESAFE_API_KEY, TYPESAFE_API_URL' : 'TYPESAFE_API_KEY', active: !!TYPESAFE_API_KEY },
     { group: 'AI & transcription', name: 'Groq (Whisper)', purpose: 'Video transcription', config: 'GROQ_API_KEY', active: !!GROQ_API_KEY },
@@ -3496,6 +3621,7 @@ initDB().then(() => {
     console.log(`Who's Behind That? server v${SERVER_VERSION} running on port ${PORT}`);
     if (!ANTHROPIC_KEY) console.warn('WARNING: ANTHROPIC_API_KEY not set — scoring endpoints will fail');
     if (!db) console.warn('WARNING: DATABASE_URL not set — history endpoints will be unavailable');
+    if (!ADMIN_KEY) console.warn('WARNING: ADMIN_KEY not set — admin-only endpoints will return 503');
 
     if (GROQ_API_KEY) {
       console.log('Video transcription enabled (yt-dlp + Groq Whisper)');

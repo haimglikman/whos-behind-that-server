@@ -1,5 +1,7 @@
 # Who's Behind That? — Architecture
 
+**Doc version:** 1.0.1 · Reflects server v2.6.0 · admin v2.29.0 · client v1.20.0
+
 Who's Behind That? (WBT) is an AI-powered narrative alignment analysis tool. Given a social media post or news article, it identifies whose agenda the content serves — and, across multiple posts, whether they form a coordinated narrative. It focuses on the Israeli-Palestinian conflict and Israeli domestic politics, and is designed and built by a single developer.
 
 Live at [whosbehindthat.com](https://whosbehindthat.com).
@@ -91,6 +93,7 @@ If Jev is unavailable, every entity goes straight to the judge.
 | `faq` | FAQ entries, grouped (Terminology, Scanning logic, Technical, Privacy) |
 | `client_sessions` | Client versions per device |
 | `jev_usage` | Jev calls and tokens |
+| `usage_quota` | Daily usage counters per hashed device ID and IP |
 
 Schema changes are additive and apply automatically on startup.
 
@@ -105,4 +108,5 @@ Schema changes are additive and apply automatically on startup.
 
 - No login and no cookies; an anonymous device ID lives in local storage and is hashed server-side.
 - All API keys are server-side environment variables; the browser never sees them.
-- A daily scan quota per device controls AI cost.
+- Operator endpoints (prompt, entity and FAQ writes, entity refresh, scan comments, and reads that expose all users' data) require an admin key (`X-Admin-Key`, checked against `ADMIN_KEY`). Without the variable set, they are refused.
+- Daily quotas are enforced on the server: 10 scans per device and 30 per IP (successful scans only), and 20 investigation calls per IP. Admin requests are exempt.
