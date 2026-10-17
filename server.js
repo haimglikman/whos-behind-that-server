@@ -5,6 +5,9 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v2.7.0.1 — Docs only: ARCHITECTURE.md updated for the chatbot. No code changes;
+//             the server now reports the four-digit version.
+//
 // v2.7.0 — Chatbot log: new chatbot_log table. POST /chatbot/log stores each
 //             question and answer from wbt-chatbot (authenticated with the
 //             X-Chatbot-Key header matching CHATBOT_LOG_KEY — a separate key
@@ -377,7 +380,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '2.7.0';
+const SERVER_VERSION = '2.7.0.1';
 
 import express from 'express';
 import cors from 'cors';
