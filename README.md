@@ -1,5 +1,9 @@
 # Who's Behind That? — Server Changelog
 
+### v2.7.0.1 (server, docs only) | Admin: v2.30.0 | Client: v1.20.0 | Chatbot: v1.2.3.1
+- Docs: ARCHITECTURE.md v1.2.0 — new "Hosting and availability" section: Render free-tier sleep, keep-awake schedule, budget-driven gaps, cold-start handling
+- No code changes; the running server remains v2.7.0
+
 ### v2.7.0 (server) | Admin: v2.30.0 | Client: v1.20.0 | Chatbot: v1.2.0
 - Chatbot log: new chatbot_log table (created automatically) storing each question and answer from wbt-chatbot with sources, status, chatbot version, model, tokens and latency
 - POST /chatbot/log: authenticated with the X-Chatbot-Key header matching the new CHATBOT_LOG_KEY env var (separate from ADMIN_KEY, no admin rights)
