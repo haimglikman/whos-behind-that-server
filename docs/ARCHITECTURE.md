@@ -1,6 +1,6 @@
 # Who's Behind That? — Architecture
 
-**Doc version:** 1.1.0 · Reflects server v2.7.0 · admin v2.30.0 · client v1.20.0 · chatbot v1.2.0
+**Doc version:** 1.2.0 · Reflects server v2.7.0 · admin v2.30.0 · client v1.20.0 · chatbot v1.2.3
 
 Who's Behind That? (WBT) is an AI-powered narrative alignment analysis tool. Given a social media post or news article, it identifies whose agenda the content serves — and, across multiple posts, whether they form a coordinated narrative. It focuses on the Israeli-Palestinian conflict and Israeli domestic politics, and is designed and built by a single developer.
 
@@ -105,6 +105,14 @@ Schema changes are additive and apply automatically on startup.
 - **Development:** `whos-behind-that-{client,admin,server}-dev` are separate repos and deployments, used to build and test major features (the Jev + Opus engine, clusters) before they are promoted to production
 - Pushing to a repo deploys it: GitHub Pages for the frontends, Render for the server
 - **Versioning:** each component has its own semantic version. Every changelog entry names the matching versions of the other two components. Versions only move forward — a rollback ships as a new version.
+
+## Hosting and availability
+
+- The server and the chatbot run on Render's free tier. A service sleeps after 15 minutes without requests, and the next request waits for a cold start (typically 30–60 seconds).
+- **Keep-awake schedule:** an external scheduler ([cron-job.org](https://cron-job.org)) pings the production server and the chatbot every 10 minutes, Sunday–Thursday 08:00–21:59 Israel time — the working hours of the recruiters the chatbot is built for.
+- **Budget-driven gaps:** nights and Friday–Saturday are deliberately left unpinged. Both services draw on one shared monthly free-hour budget, which can't cover two always-on services.
+- The development server is left to sleep; slower cold starts are acceptable there.
+- Outside the schedule, the frontends absorb cold starts: the WBT client shows a warm-up screen and retries, and the chatbot page polls `/ready` and shows a "Waking up" notice until the service responds.
 
 ## Privacy and security
 
