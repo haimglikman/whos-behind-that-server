@@ -5,6 +5,10 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v2.7.0.2 — Docs only: runtime and dependency hardening documented (Node 24
+//             pin, weekly deploy-hook redeploys, lockfile + npm ci, Dependabot).
+//             No code changes.
+//
 // v2.7.0.1 — Docs only: ARCHITECTURE.md updated for the chatbot. No code changes;
 //             the server now reports the four-digit version.
 //
@@ -380,7 +384,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '2.7.0.1';
+const SERVER_VERSION = '2.7.0.2';
 
 import express from 'express';
 import cors from 'cors';

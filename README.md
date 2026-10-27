@@ -1,5 +1,14 @@
 # Who's Behind That? — Server Changelog
 
+### v2.7.0.2 (server, docs only) | Admin: v2.30.1 | Client: v1.20.0 | Chatbot: v1.2.3.2
+- Docs: runtime and dependency hardening documented for the server and the chatbot
+  - Node.js pinned to the latest 24.x via Render's NODE_VERSION=^24.22.1 (addresses HTTP2Shell, CVE-2026-111497, in Node's Brotli decoder)
+  - Weekly redeploys via Render deploy hooks, triggered from cron-job.org on Friday mornings and staggered per service, picking up new Node 24 patches and the latest yt-dlp
+  - Committed package-lock.json with the Render build command npm ci; stale build cache cleared (npm audit: 4 vulnerabilities → 0)
+  - Dependabot alerts, security updates, malware alerts and grouped security updates enabled; merge → auto-deploy → verify → revert if broken
+- Docs: ARCHITECTURE.md v1.3.0 (new "Runtime and dependencies" section), SERVER_DECISIONS.md v1.2.0 (entry 15)
+- No code changes; package.json and package-lock.json version 2.7.0.2
+
 ### v2.7.0.1 (server, docs only) | Admin: v2.30.0 | Client: v1.20.0 | Chatbot: v1.2.3.1
 - Docs: ARCHITECTURE.md v1.2.0 — new "Hosting and availability" section: Render free-tier sleep, keep-awake schedule, budget-driven gaps, cold-start handling
 - No code changes; the running server remains v2.7.0

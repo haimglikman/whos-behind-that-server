@@ -1,6 +1,6 @@
 # Who's Behind That? — Architecture
 
-**Doc version:** 1.2.0 · Reflects server v2.7.0 · admin v2.30.0 · client v1.20.0 · chatbot v1.2.3
+**Doc version:** 1.3.0 · Reflects server v2.7.0.2 · admin v2.30.1 · client v1.20.0 · chatbot v1.2.3.2
 
 Who's Behind That? (WBT) is an AI-powered narrative alignment analysis tool. Given a social media post or news article, it identifies whose agenda the content serves — and, across multiple posts, whether they form a coordinated narrative. It focuses on the Israeli-Palestinian conflict and Israeli domestic politics, and is designed and built by a single developer.
 
@@ -113,6 +113,15 @@ Schema changes are additive and apply automatically on startup.
 - **Budget-driven gaps:** nights and Friday–Saturday are deliberately left unpinged. Both services draw on one shared monthly free-hour budget, which can't cover two always-on services.
 - The development server is left to sleep; slower cold starts are acceptable there.
 - Outside the schedule, the frontends absorb cold starts: the WBT client shows a warm-up screen and retries, and the chatbot page polls `/ready` and shows a "Waking up" notice until the service responds.
+
+## Runtime and dependencies
+
+Applies to the production server and the chatbot.
+
+- **Node.js pinned to the latest 24.x:** Render's `NODE_VERSION` is set to `^24.22.1`, so every deploy installs the newest Node 24 release and never jumps to a new major. Render otherwise freezes each service's Node version at its creation date, so it would never upgrade on its own. The pin was introduced for HTTP2Shell (CVE-2026-111497, a flaw in Node's Brotli decoder), which applies because the server fetches user-submitted URLs.
+- **Weekly redeploys:** cron-job.org calls each service's Render deploy hook on Friday mornings, staggered per service (server, chatbot, development server). Each redeploy picks up the newest Node 24 patch and, on the server, the latest yt-dlp release. Deploy hook URLs are treated as secrets.
+- **Exact, reproducible installs:** each repo commits a `package-lock.json`, and Render builds with `npm ci` — a clean install of the exact locked versions on every deploy. The lockfile is regenerated only when dependencies in `package.json` change, and both files are pushed together.
+- **Dependabot:** alerts, security updates, malware alerts and grouped security updates are enabled; routine version-update PRs are off. A security PR is merged, Render deploys it automatically, the service is checked (live status plus one real request), and the PR is reverted if anything breaks.
 
 ## Privacy and security
 

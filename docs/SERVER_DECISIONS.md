@@ -1,6 +1,6 @@
 # Who's Behind That? — Engineering Decisions
 
-**Doc version:** 1.1.0 · Reflects server v2.6.0 · admin v2.29.0 · client v1.20.0
+**Doc version:** 1.2.0 · Reflects server v2.7.0.2 · admin v2.30.1 · client v1.20.0 · chatbot v1.2.3.2
 
 Key decisions behind WBT, in chronological order. Each entry covers the problem, what was tried, what was chosen, and the result. Version numbers refer to the component changelogs.
 
@@ -179,4 +179,20 @@ Key decisions behind WBT, in chronological order. Each entry covers the problem,
 - All of this lives in two middleware functions in one place, so no route handler changed and the client needed no update.
 
 **Outcome:** The public API now does only what the public client needs. Operator actions need the key, and AI spend has a hard ceiling per device and per IP.
+
+---
+
+## 15. Keep the runtime and dependencies patched without manual work
+**Server v2.7.0.2 · Chatbot v1.2.3.2 (documentation of the setup)**
+
+**Problem:** A vulnerability review surfaced two gaps. First, HTTP2Shell (CVE-2026-111497), a flaw in Node.js's Brotli decoder, applied to WBT because the server fetches user-submitted URLs, yet Render had frozen the services on the Node version current when each was created. Second, `npm audit` reported 4 vulnerabilities (1 moderate, 2 high, 1 critical). With no lockfile, `npm install` kept reusing old sub-dependencies from Render's build cache.
+
+**Decision:**
+- Pin Node with `NODE_VERSION=^24.22.1`: always the newest 24.x patch, never an untested new major.
+- Redeploy every service weekly through Render deploy hooks, triggered from cron-job.org on Friday mornings and staggered per service, so new Node patches and the latest yt-dlp arrive without a code change.
+- Commit `package-lock.json` and build with `npm ci`, so every deploy is a clean install of exactly the locked versions.
+- Turn on Dependabot alerts, security updates, malware alerts and grouped security updates, with a simple merge → deploy → verify → revert-if-broken flow.
+- Apply the same setup to the chatbot.
+
+**Outcome:** Clearing the stale cache took the audit from 4 vulnerabilities to 0, and the first `npm ci` deploy reported "found 0 vulnerabilities". Runtime patches and dependency fixes now arrive on a schedule or as reviewable PRs, rather than depending on someone remembering to check.
 
