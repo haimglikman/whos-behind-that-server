@@ -5,9 +5,15 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
-// v2.7.0.2 — Docs only: runtime and dependency hardening documented (Node 24
-//             pin, weekly deploy-hook redeploys, lockfile + npm ci, Dependabot).
-//             No code changes.
+// v2.8.0 — Blocked-site handling for news fetching:
+//             1. Bot-protection pages are recognized (Cloudflare, Imperva,
+//                PerimeterX, DataDome, Radware, F5, Akamai, generic) and logged
+//                per domain in a new fetch_blocks table; GET /stats/blocked
+//                (admin) summarizes them. The error now says the site blocks
+//                automated reading instead of "paywalled or login".
+//             2. AMP versions of the page are tried before Archive.org.
+//             3. Per-site alternate routes (ALT_ROUTES), tried first; the first
+//                entry is Kan (kan.org.il → mobapi.kan.org.il, its app address).
 //
 // v2.7.0.1 — Docs only: ARCHITECTURE.md updated for the chatbot. No code changes;
 //             the server now reports the four-digit version.
@@ -384,7 +390,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '2.7.0.2';
+const SERVER_VERSION = '2.8.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -595,6 +601,7 @@ const ADMIN_ONLY = [
   ['GET',    /^\/client\/sessions$/],
   ['GET',    /^\/stats$/],
   ['GET',    /^\/chatbot\/list$/],
+  ['GET',    /^\/stats\/blocked$/],
 ];
 
 function requiresAdmin(req) {
@@ -769,6 +776,15 @@ async function initDB() {
         client_version TEXT NOT NULL,
         last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS fetch_blocks (
+        id SERIAL PRIMARY KEY,
+        ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        domain TEXT NOT NULL,
+        vendor TEXT,
+        http_status INTEGER,
+        rescued BOOLEAN NOT NULL DEFAULT FALSE,
+        rescued_by TEXT
       );
       CREATE TABLE IF NOT EXISTS jev_usage (
         id SERIAL PRIMARY KEY,
@@ -1489,6 +1505,20 @@ app.get('/actors/list', async (req, res) => {
 
 // GET /stats
 // ─────────────────────────────────────────────
+// Sites that blocked automated reading — per domain, for the admin (last N days, default 30)
+app.get('/stats/blocked', async (req, res) => {
+  if (!db) return res.json({ success: true, sites: [] });
+  const days = Math.max(1, Math.min(365, parseInt(req.query.days, 10) || 30));
+  try {
+    const r = await db.query(`
+      SELECT domain, COUNT(*)::int AS blocked, SUM(CASE WHEN rescued THEN 1 ELSE 0 END)::int AS rescued,
+             MAX(ts) AS last_seen, (ARRAY_AGG(vendor ORDER BY ts DESC))[1] AS vendor
+      FROM fetch_blocks WHERE ts > NOW() - ($1 || ' days')::interval
+      GROUP BY domain ORDER BY blocked DESC, last_seen DESC LIMIT 100`, [String(days)]);
+    res.json({ success: true, days, sites: r.rows.map(x => ({ domain: x.domain, blocked: x.blocked, rescued: x.rescued, vendor: x.vendor, lastSeen: x.last_seen })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/stats', async (req, res) => {
   if (!db) return res.json({ success: true, stats: {} });
   try {
@@ -2460,8 +2490,61 @@ function formatTelegramChannelContext(info) {
 - Recent activity: ${info.recentPostsShown} recent posts shown${info.oldestShown ? `, from ${info.oldestShown} to ${info.newestShown}` : ''}`;
 }
 
+// ─────────────────────────────────────────────
+// BLOCKED-SITE HANDLING (v2.8.0)
+//   1. Recognize bot-protection pages (vs paywalls) and log them per domain
+//   2. Try lighter page versions (AMP) before giving up
+//   3. Per-site alternate routes — add a site with one entry
+// ─────────────────────────────────────────────
+const ALT_ROUTE_KAN_BASE = process.env.ALT_ROUTE_KAN_BASE || 'https://mobapi.kan.org.il';   // test hook
+// Known alternate routes: same content, served from an address without bot protection.
+const ALT_ROUTES = [
+  { host: 'kan.org.il', label: "Kan's app address", to: url => url.replace(/^https?:\/\/(www\.)?kan\.org\.il/i, ALT_ROUTE_KAN_BASE) }
+];
+function hostOfUrl(url) { try { return new URL(url).hostname.replace(/^www\./, '').toLowerCase(); } catch (_) { return ''; } }
+function altRouteFor(url) {
+  const h = hostOfUrl(url);
+  return ALT_ROUTES.find(r => h === r.host || h.endsWith('.' + r.host)) || null;
+}
+
+// Identify bot-protection responses. Returns the vendor name, 'Unknown' for a generic block, or null.
+function detectBlock(status, html, headers) {
+  const h = String(html || '').slice(0, 30000);
+  const get = k => { try { return (headers && headers.get && headers.get(k)) || ''; } catch (_) { return ''; } };
+  const server = get('server').toLowerCase();
+  if (get('cf-mitigated') || /cf-chl|challenge-platform|<title>just a moment\.\.\.<\/title>|attention required! \| cloudflare/i.test(h) || (server === 'cloudflare' && (status === 403 || status === 503))) return 'Cloudflare';
+  if (get('x-iinfo') || /_Incapsula_Resource|incap_ses|Incapsula incident/i.test(h)) return 'Imperva';
+  if (/px-captcha|_pxhd|perimeterx/i.test(h)) return 'PerimeterX';
+  if (get('x-datadome') || /captcha-delivery\.com|datadome/i.test(h)) return 'DataDome';
+  if (/perfdrive|shieldsquare/i.test(h)) return 'Radware';
+  if (/The requested URL was rejected\. Please consult with your administrator/i.test(h)) return 'F5';
+  if (/access denied/i.test(h) && /Reference #[0-9a-f.]+/i.test(h)) return 'Akamai';
+  if ((status === 403 || status === 429) && (h.length < 3000 || /captcha|are you a robot|bot detection|unusual traffic/i.test(h))) return 'Unknown';
+  return null;
+}
+
+// Lighter "AMP" versions many news sites publish — often outside the bot protection
+function ampVariants(url) {
+  try {
+    const u = new URL(url);
+    if (/(^|[\/?&=.])amp([\/?&=.]|$)/i.test(u.pathname + u.search)) return [];
+    const v1 = new URL(url); v1.searchParams.set('amp', '1');
+    const v2 = new URL(url); v2.pathname = v2.pathname.replace(/\/?$/, '/amp');
+    return [v1.toString(), v2.toString()];
+  } catch (_) { return []; }
+}
+
+function recordFetchBlock(domain, vendor, status, rescuedBy) {
+  if (!db || !domain) return;
+  db.query('INSERT INTO fetch_blocks (domain, vendor, http_status, rescued, rescued_by) VALUES ($1, $2, $3, $4, $5)',
+    [domain, vendor || 'Unknown', status || null, !!rescuedBy, rescuedBy || null])
+    .catch(e => console.warn('fetch_blocks insert failed:', e.message));
+}
+
 async function fetchFromNews(url) {
   const domain = extractDomain(url);
+  let block = null;   // first bot-protection response seen: { vendor, status }
+  const noteBlock = (status, html, headers) => { if (!block) { const v = detectBlock(status, html, headers); if (v) block = { vendor: v, status }; } };
 
   // Helper: extract article text from HTML
   function extractArticle(html, url) {
@@ -2544,6 +2627,28 @@ async function fetchFromNews(url) {
     return { text, title, ogImage, author };
   }
 
+  // Known alternate route (e.g. Kan's app address): try it first — the main site would refuse anyway
+  const route = altRouteFor(url);
+  if (route) {
+    const target = route.to(url);
+    try {
+      const response = await fetch(target, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36', 'Accept': 'text/html,application/xhtml+xml', 'Accept-Language': 'he,en;q=0.8' },
+        redirect: 'follow'
+      });
+      const html = await response.text().catch(() => '');
+      if (response.ok) {
+        const { text, title, ogImage, author } = extractArticle(html, target);
+        if (text && text.length >= 100) {
+          const fullText = title ? `${title}\n\n${text}` : text;
+          console.log(`News fetch (alternate route: ${route.label}) success from ${domain}, length: ${fullText.length}`);
+          return await enrichWithYoutube(html, fullText, author, domain, title, ogImage);
+        }
+      }
+      console.log(`News fetch alternate route (${route.label}) gave no article for ${domain} (HTTP ${response.status}) — trying the main site`);
+    } catch (e) { console.log(`News fetch alternate route error for ${domain}:`, e.message); }
+  }
+
   // Tier 1: Basic headers (current approach)
   const basicUserAgents = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -2557,10 +2662,10 @@ async function fetchFromNews(url) {
         headers: { 'User-Agent': ua, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9,he;q=0.8' },
         redirect: 'follow'
       });
-      if (!response.ok) continue;
-      const html = await response.text();
+      const html = await response.text().catch(() => '');
+      if (!response.ok) { noteBlock(response.status, html, response.headers); continue; }
       const { text, title, ogImage, author } = extractArticle(html, url);
-      if (!text || text.length < 100) continue;
+      if (!text || text.length < 100) { noteBlock(response.status, html, response.headers); continue; }
       const fullText = title ? `${title}\n\n${text}` : text;
       console.log(`News fetch (tier 1) success from ${domain}, length: ${fullText.length}`);
       return await enrichWithYoutube(html, fullText, author, domain, title, ogImage);
@@ -2589,8 +2694,8 @@ async function fetchFromNews(url) {
 
   try {
     const response = await fetch(url, { headers: browserHeaders, redirect: 'follow' });
+    const html = await response.text().catch(() => '');
     if (response.ok) {
-      const html = await response.text();
       const { text, title, ogImage, author } = extractArticle(html, url);
       if (text && text.length >= 100) {
         const fullText = title ? `${title}\n\n${text}` : text;
@@ -2598,7 +2703,24 @@ async function fetchFromNews(url) {
         return await enrichWithYoutube(html, fullText, author, domain, title, ogImage);
       }
     }
+    noteBlock(response.status, html, response.headers);
   } catch(e) { console.log(`News fetch tier 2 error for ${domain}:`, e.message); }
+
+  // Tier 2b: lighter AMP versions of the page — often outside the bot protection
+  for (const variant of ampVariants(url)) {
+    try {
+      const response = await fetch(variant, { headers: browserHeaders, redirect: 'follow' });
+      if (!response.ok) continue;
+      const html = await response.text();
+      const { text, title, ogImage, author } = extractArticle(html, variant);
+      if (text && text.length >= 200) {
+        const fullText = title ? `${title}\n\n${text}` : text;
+        console.log(`News fetch (AMP version) success from ${domain}, length: ${fullText.length}`);
+        if (block) recordFetchBlock(domain, block.vendor, block.status, 'AMP');
+        return await enrichWithYoutube(html, fullText, author, domain, title, ogImage);
+      }
+    } catch (e) { /* try the next variant */ }
+  }
 
   // Tier 3: Archive.org fallback
   console.log(`News fetch tier 2 failed for ${domain}, trying Archive.org`);
@@ -2614,11 +2736,17 @@ async function fetchFromNews(url) {
       if (text && text.length >= 100) {
         const fullText = title ? `${title}\n\n${text}` : text;
         console.log(`News fetch (tier 3 archive.org) success from ${domain}, length: ${fullText.length}`);
+        if (block) recordFetchBlock(domain, block.vendor, block.status, 'Archive.org');
         return await enrichWithYoutube(html, fullText, author, domain, title, ogImage);
       }
     }
   } catch(e) { console.log(`News fetch tier 3 error for ${domain}:`, e.message); }
 
+  if (block) {
+    recordFetchBlock(domain, block.vendor, block.status, null);
+    console.log(`[BLOCKED] ${domain}: ${block.vendor} bot protection (HTTP ${block.status})`);
+    throw new Error(`${domain} blocks automated reading${block.vendor !== 'Unknown' ? ' (' + block.vendor + ' bot protection)' : ''}. Please paste the article text manually below.`);
+  }
   throw new Error(`Could not fetch article from ${domain}. The article may be paywalled, require login, or not yet indexed. You can paste the article text manually below.`);
 }
 
