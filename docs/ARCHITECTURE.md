@@ -1,6 +1,6 @@
 # Who's Behind That? — Architecture
 
-**Doc version:** 1.3.0 · Reflects server v2.7.0.2 · admin v2.30.1 · client v1.20.0 · chatbot v1.2.3.2
+**Doc version:** 1.3.0 · Reflects server v2.8.0 · admin v2.31.0 · client v1.20.0 · chatbot v1.2.3.1
 
 Who's Behind That? (WBT) is an AI-powered narrative alignment analysis tool. Given a social media post or news article, it identifies whose agenda the content serves — and, across multiple posts, whether they form a coordinated narrative. It focuses on the Israeli-Palestinian conflict and Israeli domestic politics, and is designed and built by a single developer.
 
@@ -55,7 +55,9 @@ Each frontend is a single self-contained HTML file with no build step. The serve
 
 1. **Fetch** — the server detects the platform from the URL and extracts text and metadata:
    - X: oEmbed · Facebook / Instagram: OpenGraph scraping with multiple user agents · Telegram: public post page and embed widget
-   - News: three-tier fetch — basic headers → full browser-like headers → Archive.org fallback; any URL with a non-root path is attempted
+   - News: basic headers → full browser-like headers → the page's lighter AMP version → Archive.org; any URL with a non-root path is attempted
+   - Sites known to block automated reading get a per-site alternate route, tried first. The first is Kan, read through its app address (`mobapi.kan.org.il`)
+   - Bot-protection pages (Cloudflare, Imperva, PerimeterX, DataDome, Radware, F5, Akamai) are recognized, so the user is told the site blocks automated reading rather than that it may be paywalled; each block is logged per domain
    - Video (YouTube, TikTok, Instagram, Facebook, X, Telegram): transcript via TranscriptAPI (YouTube) or yt-dlp audio + Groq Whisper, plus caption, hashtags and account
    - Manual paste is always available for private or paywalled content
 2. **Translate** — Hebrew and Arabic content is translated to English (Claude Haiku) before screening.
@@ -79,7 +81,7 @@ If Jev is unavailable, every entity goes straight to the judge.
 - **Entity database** — the political actors that posts are scored against. It is versioned, edited in admin, pushed to the server DB, and loaded by the client on page load (with a built-in default as fallback).
 - **Prompt management** — prompts live in the DB with version history, model selection, and live activation from admin. An in-memory cache refreshes on save.
 - **Actor research** — Claude with web search profiles the post's author, including a bot-probability estimate with reasoning.
-- **Monitoring** — per-scan token and model tracking, a `jev_usage` table, `/stats`, client version registration, and `/system/info`, which reports the models and services actually in use without exposing secrets.
+- **Monitoring** — per-scan token and model tracking, a `jev_usage` table, `/stats`, client version registration, and `/system/info`, which reports the models and services actually in use without exposing secrets. `/stats/blocked` lists the news sites that blocked automated reading, shown in the admin's About & Setup.
 - **Instagram carousel generator** (admin) — renders 1080×1080 slides from saved cluster data with the HTML Canvas API, and exports them as a ZIP with JSZip.
 
 ## Data model (PostgreSQL)
@@ -94,6 +96,7 @@ If Jev is unavailable, every entity goes straight to the judge.
 | `faq` | FAQ entries, grouped (Terminology, Scanning logic, Technical, Privacy) |
 | `client_sessions` | Client versions per device |
 | `jev_usage` | Jev calls and tokens |
+| `fetch_blocks` | News sites that blocked automated reading: domain, detected protection, and whether a fallback still got the article |
 | `usage_quota` | Daily usage counters per hashed device ID and IP |
 | `chatbot_log` | Questions and answers from the chatbot, with sources, status, version, tokens and latency |
 
@@ -113,15 +116,6 @@ Schema changes are additive and apply automatically on startup.
 - **Budget-driven gaps:** nights and Friday–Saturday are deliberately left unpinged. Both services draw on one shared monthly free-hour budget, which can't cover two always-on services.
 - The development server is left to sleep; slower cold starts are acceptable there.
 - Outside the schedule, the frontends absorb cold starts: the WBT client shows a warm-up screen and retries, and the chatbot page polls `/ready` and shows a "Waking up" notice until the service responds.
-
-## Runtime and dependencies
-
-Applies to the production server and the chatbot.
-
-- **Node.js pinned to the latest 24.x:** Render's `NODE_VERSION` is set to `^24.22.1`, so every deploy installs the newest Node 24 release and never jumps to a new major. Render otherwise freezes each service's Node version at its creation date, so it would never upgrade on its own. The pin was introduced for HTTP2Shell (CVE-2026-111497, a flaw in Node's Brotli decoder), which applies because the server fetches user-submitted URLs.
-- **Weekly redeploys:** cron-job.org calls each service's Render deploy hook on Friday mornings, staggered per service (server, chatbot, development server). Each redeploy picks up the newest Node 24 patch and, on the server, the latest yt-dlp release. Deploy hook URLs are treated as secrets.
-- **Exact, reproducible installs:** each repo commits a `package-lock.json`, and Render builds with `npm ci` — a clean install of the exact locked versions on every deploy. The lockfile is regenerated only when dependencies in `package.json` change, and both files are pushed together.
-- **Dependabot:** alerts, security updates, malware alerts and grouped security updates are enabled; routine version-update PRs are off. A security PR is merged, Render deploys it automatically, the service is checked (live status plus one real request), and the PR is reverted if anything breaks.
 
 ## Privacy and security
 
