@@ -1,5 +1,11 @@
 # Who's Behind That? — Server Changelog
 
+### v2.9.0 (server) | Admin: v2.31.0 | Client: v1.20.0 | Chatbot: v1.2.3.1
+- Scoring favours hidden interest: weights 65/20/15 (interest / modus operandi / narrative), was 55/35/10 — configurable with SCORE_WEIGHTS
+- Mechanism rule: interest 80+ requires a specific, post-tied mechanism, otherwise it is capped at 70 — enforced in code
+- Every judged entity's sub-scores are logged, for re-weighting tests
+- /system/info reports the scoring weights; ARCHITECTURE.md updated (doc v1.4.0)
+
 ### v2.8.0 (server) | Admin: v2.31.0 | Client: v1.20.0 | Chatbot: v1.2.3.1
 - Blocked-site handling: bot-protection pages (Cloudflare, Imperva, PerimeterX, DataDome, Radware, F5, Akamai) are recognized and named in the error, instead of "paywalled or login"
 - Every block is logged per domain (new fetch_blocks table); new admin-only GET /stats/blocked
