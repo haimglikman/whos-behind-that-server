@@ -5,6 +5,15 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v2.9.0 — Scoring favours hidden interest, with a mechanism guardrail:
+//             1. Weights 65/20/15 (interest / modus operandi / narrative), was
+//                55/35/10; configurable with SCORE_WEIGHTS.
+//             2. Mechanism rule: interest 80+ needs a specific, post-tied
+//                mechanism (new tool field), otherwise it is capped at 70 —
+//                enforced in code, so it also applies to a saved Judge prompt.
+//             3. Logs every judged entity's sub-scores, for re-weighting tests.
+//             4. /system/info reports the scoring weights.
+//
 // v2.8.0 — Blocked-site handling for news fetching:
 //             1. Bot-protection pages are recognized (Cloudflare, Imperva,
 //                PerimeterX, DataDome, Radware, F5, Akamai, generic) and logged
@@ -390,7 +399,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '2.8.0';
+const SERVER_VERSION = '2.9.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -421,6 +430,19 @@ const JEV_THRESHOLD      = parseFloat(process.env.JEV_THRESHOLD || '0.3');   // 
 const JEV_MIN_SHORTLIST  = parseInt(process.env.JEV_MIN_SHORTLIST || '5', 10); // always send at least this many to Claude
 const JEV_MAX_SHORTLIST  = parseInt(process.env.JEV_MAX_SHORTLIST || '15', 10);
 const JEV_PAIR_THRESHOLD = parseFloat(process.env.JEV_PAIR_THRESHOLD || '0.25');
+// Alignment score = interest × w1 + modus operandi × w2 + narrative × w3 (v2.9.0 default 65/20/15).
+// Override with SCORE_WEIGHTS, e.g. "55/35/10" — values are normalized, so they needn't sum to 100.
+const SCORE_WEIGHTS = (function () {
+  const p = String(process.env.SCORE_WEIGHTS || '65/20/15').split('/').map(Number);
+  const ok = p.length === 3 && p.every(n => isFinite(n) && n >= 0) && (p[0] + p[1] + p[2]) > 0;
+  const w = ok ? p : [65, 20, 15];
+  if (!ok && process.env.SCORE_WEIGHTS) console.warn('SCORE_WEIGHTS is invalid ("' + process.env.SCORE_WEIGHTS + '") — using 65/20/15');
+  const sum = w[0] + w[1] + w[2];
+  return { interest: w[0] / sum, mo: w[1] / sum, narrative: w[2] / sum, label: w.join('/') };
+})();
+// Mechanism rule: an interest score at/above this needs a stated, post-specific mechanism — otherwise it is capped
+const MECHANISM_MIN_INTEREST = 80;
+const MECHANISM_CAP = 70;
 
 const DEFAULT_MODEL = process.env.CLAUDE_DEFAULT_MODEL || 'claude-sonnet-5';
 const DEEP_MODEL    = process.env.CLAUDE_DEEP_MODEL    || 'claude-opus-5-5';
@@ -1253,7 +1275,8 @@ function buildSystemInfo() {
     deep_score: buildDeepPrompt('${postText}', '${entitySummaries}', '${otherEntities}')
   };
 
-  return { version: SERVER_VERSION, models, services, promptDefaults };
+  return { version: SERVER_VERSION, models, services, promptDefaults,
+    scoring: { weights: SCORE_WEIGHTS.label, mechanismRule: 'interest ' + MECHANISM_MIN_INTEREST + '+ needs a mechanism, otherwise capped at ' + MECHANISM_CAP } };
 }
 
 app.get('/system/info', (req, res) => {
@@ -3228,7 +3251,7 @@ ${otherEntities}
 IMPORTANT: The main beneficiary of a post is often NOT mentioned in it — e.g. a post attacking the government serves the opposition parties, and a critique of one camp's policy serves its rivals. If any entity on this list is a primary or secondary beneficiary, include it in your results using its id. Only include entities from this list when they are primary or secondary.
 ` : ''}
 For EACH candidate entity, score three dimensions from 0 to 100:
-- interest: Would spreading this post advance the entity's strategic interest? Consider content (the message itself serves the entity) and context (the post attacks, discredits, or weakens the entity's rivals).
+- interest: Would spreading this post advance the entity's underlying (hidden) strategic interest — what it actually wants, which may differ from its public narrative? Consider content (the message itself serves the entity) and context (the post attacks, discredits, or weakens the entity's rivals). This is where non-obvious beneficiaries are found.
 - mo: Does the post's construction match how this entity AND its supporters typically communicate — rhetoric, framing devices, talking points, emotional register? This is about the content's style, not about who wrote it.
 - narrative: Does the post echo the entity's public narrative and talking points?
 
@@ -3251,11 +3274,12 @@ RULES:
 - Complete the beneficiary chain: when a post attacks or discredits one side, its rivals and opponents benefit.
 - Rankings and preference lists: the elevated entity benefits; the dismissed one does not.
 - ADVERSARIAL FRAMING: If the post portrays an entity as a threat, aggressor, or enemy, that entity cannot be a primary match on interest alone. Score it high only if the post (a) amplifies the entity's power or fear factor in a way that serves its deterrence, or (b) explicitly advocates a policy whose main beneficiary is that entity. A recommendation that incidentally benefits an adversary, while the post's framing opposes it, is at most a secondary match.
+- MECHANISM: An interest score of 80 or more requires a specific, checkable mechanism tied to THIS post — "this post does X → which causes Y → which advances the entity's goal Z". State it in the mechanism field and reflect it in why. A benefit that could be claimed about almost any political post (e.g. "internal division weakens Israel, which serves its enemies") is not a mechanism: score such interest 50 or lower.
 - Quotes and clips: a statement quoted, shown, or debunked in the post may belong to someone the author opposes. Judge the author's overall framing, not isolated lines.
 - The post may be in Hebrew or Arabic. An English translation and an automatic political-context note may be provided — use them as aids, but judge the original meaning.
 
 For every entity with alignment "primary" or "secondary", write in English only:
-- why: 2-3 sentences on which interest is served and how.
+- why: 2-3 sentences on which interest is served and how. For interest 80+, spell out the mechanism so a reader can follow it.
 - missing: 2-3 sentences on relevant context the post omits.
 For alignment "none", leave why and missing empty.
 
@@ -3280,11 +3304,12 @@ const ALIGNMENT_TOOL = {
           properties: {
             id: { type: ['integer', 'string'], description: 'Entity id exactly as shown in brackets' },
             narrative: { type: 'integer', description: '0-100' },
-            interest: { type: 'integer', description: '0-100' },
+            interest: { type: 'integer', description: '0-100. 80 or more requires a mechanism' },
             mo: { type: 'integer', description: '0-100' },
             alignment: { type: 'string', enum: ['primary', 'secondary', 'none'] },
             why: { type: 'string' },
-            missing: { type: 'string' }
+            missing: { type: 'string' },
+            mechanism: { type: 'string', description: 'Required when interest is 80 or more: the specific, checkable chain from this post to the entity\'s benefit — "this post does X → which causes Y → which advances Z". Empty otherwise.' }
           },
           required: ['id', 'narrative', 'interest', 'mo', 'alignment', 'why', 'missing']
         }
@@ -3401,19 +3426,27 @@ async function scoreWithClaude(postText, entities) {
     const e = byId[String(m.id)];
     if (!e || seen.has(String(e.id))) return;
     seen.add(String(e.id));
-    const narrative = clamp(m.narrative), interest = clamp(m.interest), mo = clamp(m.mo);
+    const narrative = clamp(m.narrative), mo = clamp(m.mo);
+    let interest = clamp(m.interest);
+    const mechanism = String(m.mechanism || '').replace(/\s+/g, ' ').trim();
+    const capped = interest >= MECHANISM_MIN_INTEREST && mechanism.length < 25;   // no real mechanism → cap
+    if (capped) interest = MECHANISM_CAP;
     const alignment = (m.alignment === 'primary' || m.alignment === 'secondary') ? m.alignment : '';
-    matches.push({
+    const match = {
       id: e.id, name: e.name, narrative, interest, mo,
-      pct: Math.round(interest * 0.55 + mo * 0.35 + narrative * 0.10),  // computed in code, not by the model
+      pct: Math.round(interest * SCORE_WEIGHTS.interest + mo * SCORE_WEIGHTS.mo + narrative * SCORE_WEIGHTS.narrative),   // computed in code, not by the model
       alignment,
       why: alignment ? (m.why || '') : '',
-      missing: alignment ? (m.missing || '') : ''
-    });
+      missing: alignment ? (m.missing || '') : '',
+      mechanism: alignment ? mechanism : ''
+    };
+    if (capped) match.interestCapped = true;
+    matches.push(match);
   });
   matches.sort((a, b) => b.pct - a.pct);
   const top = matches.filter(m => m.alignment).concat(matches.filter(m => !m.alignment)).slice(0, 8);
   console.log('[JUDGE] ' + (top.length ? top.map(m => `${m.name} ${m.pct}%${m.alignment ? ' ' + m.alignment : ''}${shortIds.has(String(m.id)) ? '' : ' (+not mentioned)'}`).join(' | ') : 'no matches'));
+  if (matches.length) console.log('[JUDGE] sub-scores I/M/N (weights ' + SCORE_WEIGHTS.label + '): ' + matches.map(m => `${m.name} ${m.interest}/${m.mo}/${m.narrative}${m.alignment ? ' ' + m.alignment : ''}${m.interestCapped ? ' (interest capped: no mechanism)' : ''}`).join(' | '));
 
   const tas = parseInt(judged.result.text_ai_score, 10);
   console.log(`[TOKENS] scan: claude in=${inTok} out=${outTok} | jev in=${triage.tokens || 0} | judged ${shortlist.length}/${entities.length} entities | ${Date.now() - t0}ms`);
