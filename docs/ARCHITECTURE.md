@@ -1,6 +1,6 @@
 # Who's Behind That? — Architecture
 
-**Doc version:** 1.3.0 · Reflects server v2.8.0 · admin v2.31.0 · client v1.20.0 · chatbot v1.2.3.1
+**Doc version:** 1.4.0 · Reflects server v2.9.0 · admin v2.31.0 · client v1.20.0 · chatbot v1.2.3.1
 
 Who's Behind That? (WBT) is an AI-powered narrative alignment analysis tool. Given a social media post or news article, it identifies whose agenda the content serves — and, across multiple posts, whether they form a coordinated narrative. It focuses on the Israeli-Palestinian conflict and Israeli domestic politics, and is designed and built by a single developer.
 
@@ -62,7 +62,7 @@ Each frontend is a single self-contained HTML file with no build step. The serve
    - Manual paste is always available for private or paywalled content
 2. **Translate** — Hebrew and Arabic content is translated to English (Claude Haiku) before screening.
 3. **Screen (Jev)** — Jev, a classification model (TypeSafe, via OpenRouter), answers three literal questions per entity in one request: is it *mentioned*, *criticized*, *praised*? This produces a shortlist.
-4. **Judge (Claude Opus)** — one structured-output call scores the shortlist, using calibration anchors and rules for adversarial framing and quoted clips. It also receives a names-only list of all other entities, so it can add beneficiaries the post never mentions. The final score is computed in code, not by the model.
+4. **Judge (Claude Opus)** — one structured-output call scores the shortlist, using calibration anchors and rules for adversarial framing and quoted clips. It also receives a names-only list of all other entities, so it can add beneficiaries the post never mentions. The final score is computed in code, not by the model, from three sub-scores: **hidden interest 65%**, **modus operandi 20%**, **narrative 15%** (configurable). Weighting hidden interest most surfaces beneficiaries readers wouldn't spot themselves. As a guardrail, an interest score of 80 or more counts only when the judge states a specific mechanism linking this post to the benefit; otherwise it is capped at 70, which keeps generic "this serves Israel's enemies" readings out.
 5. **Persist** — the scan is stored with scan ID, app / server versions, models used, and Claude and Jev token counts.
 
 If Jev is unavailable, every entity goes straight to the judge.
