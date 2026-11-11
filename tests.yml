@@ -1,0 +1,19 @@
+# Runs the server's test suite on every push.
+# The tests start the real server against local stand-ins — no API keys or secrets are needed.
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: node --test --test-reporter=spec tests/*.test.mjs
