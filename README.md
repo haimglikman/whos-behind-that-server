@@ -1,5 +1,13 @@
 # Who's Behind That? — Server Changelog
 
+### v2.10.0 (server) | Admin: v2.32.0 | Client: v1.23.0 | Chatbot: v1.2.3.1
+- Facebook and Instagram: Meta's public embed pages are tried first (Instagram /embed/captioned/, Facebook post and video plugins), which load without a login; a video in an Instagram embed is transcribed. OpenGraph and web search remain as fallbacks
+- Every embed attempt is logged with a [META] line: HTTP status, login wall, and how much text was found
+- New POST /analyze-image: Claude reads a screenshot (post text, account, what the image shows), then the post is screened and judged like any other; the image is not stored
+- New "vision" model task, shown in /system/info and editable in Prompts; screenshots count toward the daily scan quota
+- Tests: 7 new tests for the embed routes and screenshot analysis (30 in total)
+- ARCHITECTURE.md updated (doc v1.5.0)
+
 ### v2.9.0 (server) | Admin: v2.31.0 | Client: v1.20.0 | Chatbot: v1.2.3.1
 - Scoring favours hidden interest: weights 65/20/15 (interest / modus operandi / narrative), was 55/35/10 — configurable with SCORE_WEIGHTS
 - Mechanism rule: interest 80+ requires a specific, post-tied mechanism, otherwise it is capped at 70 — enforced in code

@@ -5,6 +5,17 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v2.10.0 — Facebook and Instagram:
+//             1. Embed pages tried first (Instagram /embed/captioned/, Facebook
+//                plugins/post.php and video.php) — public, no login; the
+//                OpenGraph route stays as fallback. Instagram videos found in
+//                the embed are transcribed. Every attempt is logged ([META]).
+//             2. Screenshot analysis: POST /analyze-image reads an uploaded
+//                screenshot or meme with Claude (post text, author, and what an
+//                image shows), then runs normal screening and judging. Images
+//                are not stored. New 'vision' model task (default model).
+//             Test hooks: META_IG_BASE, META_FB_BASE.
+//
 // v2.9.0 — Scoring favours hidden interest, with a mechanism guardrail:
 //             1. Weights 65/20/15 (interest / modus operandi / narrative), was
 //                55/35/10; configurable with SCORE_WEIGHTS.
@@ -399,7 +410,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '2.9.0';
+const SERVER_VERSION = '2.10.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -463,6 +474,7 @@ const promptCache = {
   entities:   { model: null, text: null },
   publication:{ model: null, text: null },
   cluster_check:{ model: null, text: null },
+  vision:     { model: null, text: null },
   scan:       { model: null, text: null },   // legacy — not used by the v2 engine
   coherence:  { model: null, text: null }    // legacy — not used by the v2 engine
 };
@@ -644,7 +656,7 @@ app.use((req, res, next) => {
 // QUOTAS — daily limits enforced server-side (UTC days)
 // ─────────────────────────────────────────────
 const QUOTAS = {
-  scan:        { paths: ['/analyze', '/fetch-and-analyze', '/research-actor'], perDevice: 10, perIp: 30, countOn: 'success' },
+  scan:        { paths: ['/analyze', '/analyze-image', '/fetch-and-analyze', '/research-actor'], perDevice: 10, perIp: 30, countOn: 'success' },
   investigate: { paths: ['/investigate/detect', '/investigate/synthesize', '/convergent-interest'], perIp: 20, countOn: 'request' },
 };
 const memQuota = new Map();   // fallback when the DB is unavailable
@@ -1226,7 +1238,8 @@ const TASK_DESCRIPTIONS = {
   convergent:    { label: 'Convergent interest', prompt: true },
   entities:      { label: 'Entity refresh' },
   websearch:     { label: 'Web-search post fetching' },
-  publication:   { label: 'Publication research' }
+  publication:   { label: 'Publication research' },
+  vision:        { label: 'Reading uploaded screenshots (post text and image content)' }
 };
 
 function modelEnvVar(id) {
@@ -1331,6 +1344,39 @@ app.post('/analyze', async (req, res) => {
 // ─────────────────────────────────────────────
 // POST /fetch-and-analyze
 // ─────────────────────────────────────────────
+// POST /analyze-image — analyze an uploaded screenshot or meme
+app.post('/analyze-image', async (req, res) => {
+  const { image, mediaType, entities } = req.body || {};
+  if (!image || typeof image !== 'string') return res.status(400).json({ error: 'image is required' });
+  if (!IMAGE_TYPES.includes(mediaType)) return res.status(400).json({ error: 'Unsupported image type. Use JPEG, PNG, WebP or GIF.' });
+  if (!entities || !entities.length) return res.status(400).json({ error: 'entities array is required' });
+  if (image.length > IMAGE_MAX_BASE64) return res.status(413).json({ error: 'The image is too large. Please upload a smaller screenshot.' });
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
+  try {
+    const read = await readScreenshot(image.replace(/^data:[^,]+,/, ''), mediaType);
+    const hasContent = !!((read.post_text && String(read.post_text).trim()) || (read.image_description && String(read.image_description).trim()));
+    if (read.readable === false || !hasContent) {
+      console.log('[IMAGE] nothing readable in the upload');
+      return res.status(422).json({ error: 'Could not read a post in this image. Try a sharper screenshot that shows the whole post.' });
+    }
+    const text = buildScreenshotAnalysisText(read);
+    console.log(`[IMAGE] read ${String(read.post_text || '').length} chars of post text${read.image_description ? ' + image description' : ''} | platform=${read.platform || 'unknown'} | model=${getModel('vision')}`);
+    const analysis = await scoreWithClaude(text, entities);
+    const tokens = analysis._tokens || { input: 0, output: 0 };
+    const post = {
+      text, author: read.author || null, authorHandle: read.author || null, source: 'screenshot', fromImage: true,
+      detectedPlatform: read.platform || 'unknown', ogTitle: read.post_text ? String(read.post_text).split('\n')[0].slice(0, 120) : null
+    };
+    res.json({ success: true, platform: 'screenshot', post, analysis,
+      inputTokens: tokens.input + read._tokens.input, outputTokens: tokens.output + read._tokens.output,
+      jevTokens: (analysis.triage && analysis.triage.tokens) || 0,
+      models: Object.assign({}, analysis.models || {}, { vision: getModel('vision') }) });
+  } catch (err) {
+    console.error('analyze-image error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/fetch-and-analyze', async (req, res) => {
   const { url, entities } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
@@ -2519,6 +2565,176 @@ function formatTelegramChannelContext(info) {
 //   2. Try lighter page versions (AMP) before giving up
 //   3. Per-site alternate routes — add a site with one entry
 // ─────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// META EMBED PAGES (v2.10.0) — Instagram and Facebook
+// Meta serves these pages so other sites can display a public post; they
+// need no login. Tried first; the older OpenGraph route remains the fallback.
+// Unofficial for text extraction, so every attempt is logged with what it found.
+// ─────────────────────────────────────────────
+const META_IG_BASE = process.env.META_IG_BASE || 'https://www.instagram.com';   // test hooks
+const META_FB_BASE = process.env.META_FB_BASE || 'https://www.facebook.com';
+const META_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
+
+async function fetchMetaPage(target) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const r = await globalThis.fetch(target, { headers: { 'User-Agent': META_UA, 'Accept': 'text/html,application/xhtml+xml', 'Accept-Language': 'en-US,en;q=0.9,he;q=0.8' }, redirect: 'follow', signal: ctrl.signal });
+    const html = await r.text().catch(() => '');
+    return { status: r.status, html, finalUrl: r.url || target };
+  } finally { clearTimeout(timer); }
+}
+
+function instagramPostRef(url) {
+  const m = String(url || '').match(/instagram\.com\/(?:[^\/?#]+\/)?(p|reel|reels|tv)\/([A-Za-z0-9_-]+)/i);
+  return m ? { kind: m[1].toLowerCase() === 'reels' ? 'reel' : m[1].toLowerCase(), code: m[2] } : null;
+}
+
+// Instagram embeds carry the post as JSON inside the page; older ones only as markup. Try both.
+function parseInstagramEmbed(html) {
+  const out = { caption: '', username: null, image: null, videoUrl: null, layer: null };
+  let media = null;
+  try {
+    const m = html.match(/"contextJSON"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    if (m) { const ctx = JSON.parse(JSON.parse('"' + m[1] + '"')); media = (ctx.gql_data && ctx.gql_data.shortcode_media) || (ctx.context && ctx.context.media) || null; }
+  } catch (_) {}
+  if (!media) {
+    try {
+      const m = html.match(/window\.__additionalDataLoaded\(\s*['"][^'"]*['"]\s*,\s*(\{[\s\S]*?\})\s*\)\s*;/);
+      if (m) { const d = JSON.parse(m[1]); media = d.shortcode_media || (d.graphql && d.graphql.shortcode_media) || null; }
+    } catch (_) {}
+  }
+  if (media) {
+    const edges = media.edge_media_to_caption && media.edge_media_to_caption.edges;
+    out.caption = String((edges && edges[0] && edges[0].node && edges[0].node.text) || '').trim();
+    out.username = (media.owner && media.owner.username) || null;
+    out.image = media.display_url || null;
+    out.videoUrl = media.video_url || null;
+    if (out.caption || out.username) out.layer = 'json';
+  }
+  if (!out.caption) {
+    const $ = cheerio.load(html);
+    const cap = $('.Caption').first();
+    if (cap.length) {
+      const c = cap.clone();
+      c.find('.CaptionUsername, .CaptionComments').remove();
+      c.find('br').replaceWith('\n');
+      const t = c.text().replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+      if (t) { out.caption = t; out.layer = out.layer || 'markup'; }
+    }
+    if (!out.username) out.username = $('.CaptionUsername').first().text().trim() || $('.UsernameText').first().text().trim() || null;
+    if (!out.image) out.image = $('img.EmbeddedMediaImage').first().attr('src') || null;
+  }
+  return out;
+}
+
+async function fetchInstagramEmbed(url) {
+  const ref = instagramPostRef(url);
+  if (!ref) return null;
+  try {
+    const page = await fetchMetaPage(`${META_IG_BASE}/${ref.kind}/${ref.code}/embed/captioned/`);
+    const loginWall = /\/accounts\/login/i.test(page.finalUrl) || /<title>\s*Login\b/i.test(page.html);
+    const p = (page.status === 200 && !loginWall) ? parseInstagramEmbed(page.html) : { caption: '', layer: null };
+    console.log(`[META] instagram embed ${ref.kind}/${ref.code}: HTTP ${page.status}, ${Math.round(page.html.length / 1024)} KB${loginWall ? ', login wall' : ''} | layer=${p.layer || 'none'} | caption=${p.caption.length} chars${p.videoUrl ? ' | video' : ''}`);
+    if (!p.caption && !p.videoUrl) return null;
+    const out = {
+      text: p.caption, author: p.username, authorHandle: p.username, source: 'instagram', domain: 'instagram.com',
+      ogImage: p.image || null, ogTitle: p.caption ? p.caption.split('\n')[0].slice(0, 120) : null
+    };
+    if (p.videoUrl && GROQ_API_KEY) {
+      const transcript = await transcribeUrl(p.videoUrl);
+      if (transcript) { out.hasVideoTranscript = true; out.text = buildVideoAnalysisText({ uploader: p.username, caption: p.caption, tags: [], transcript }, 'instagram'); }
+    }
+    return out.text ? out : null;
+  } catch (e) {
+    console.log('[META] instagram embed failed:', e.message);
+    return null;
+  }
+}
+
+// Facebook ships parts of its pages inside HTML comments; unwrap them before reading.
+function parseFacebookEmbed(html) {
+  const unwrapped = html + '\n' + [...html.matchAll(/<!--([\s\S]*?)-->/g)].map(m => m[1]).join('\n');
+  const $ = cheerio.load(unwrapped);
+  $('script, style, noscript').remove();
+  const read = el => { const c = $(el).clone(); c.find('br').replaceWith('\n'); c.find('p, div').each((i, x) => { $(x).append('\n'); }); return c.text().replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim(); };
+  let text = '', layer = null;
+  for (const sel of ['[data-testid="post_message"]', '.userContent', '[data-ad-preview="message"]', '._5pbx']) {
+    const el = $(sel).first();
+    if (el.length) { const t = read(el); if (t.length >= 20) { text = t; layer = sel; break; } }
+  }
+  const author = $('h5 a, .fwb a, span.fwb, a._2_79').first().text().trim() || null;
+  const image = $('img.scaledImageFitWidth, img.scaledImageFitHeight').first().attr('src') || null;
+  return { text, author, image, layer };
+}
+
+async function fetchFacebookEmbed(url) {
+  try {
+    const isVideo = /\/videos\/|\/reel\/|\/watch|fb\.watch/i.test(url);
+    const target = `${META_FB_BASE}/plugins/${isVideo ? 'video' : 'post'}.php?href=${encodeURIComponent(url)}&show_text=true&width=500`;
+    const page = await fetchMetaPage(target);
+    const walled = /you must log in|log in to continue|log into facebook/i.test(page.html.slice(0, 200000)) && !/post_message|userContent/.test(page.html);
+    const gone = /content isn't available|content is(?: no longer|n't) available|post is no longer available/i.test(page.html);
+    const p = (page.status === 200 && !walled) ? parseFacebookEmbed(page.html) : { text: '', layer: null };
+    console.log(`[META] facebook embed (${isVideo ? 'video' : 'post'}): HTTP ${page.status}, ${Math.round(page.html.length / 1024)} KB${walled ? ', login wall' : ''}${gone ? ', unavailable notice' : ''} | layer=${p.layer || 'none'} | text=${p.text.length} chars`);
+    if (!p.text) return null;
+    return { text: p.text, author: p.author, authorHandle: p.author, source: 'facebook', domain: 'facebook.com', ogImage: p.image || null, ogTitle: p.text.split('\n')[0].slice(0, 120) };
+  } catch (e) {
+    console.log('[META] facebook embed failed:', e.message);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────
+// SCREENSHOT ANALYSIS (v2.10.0) — works for anything no server can reach
+// Claude reads the uploaded image (post text, author, and what a photo or meme
+// shows); the result then goes through the normal screening and judging.
+// The image itself is never stored.
+// ─────────────────────────────────────────────
+const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+const IMAGE_MAX_BASE64 = 1800000;   // fits the 2 MB request limit; the apps downscale before sending
+
+async function readScreenshot(imageBase64, mediaType) {
+  const prompt = `A user uploaded this image for narrative analysis. It is usually a screenshot of a social media post (Facebook, Instagram, WhatsApp, X, Telegram, TikTok) or a meme. Read it carefully and report what it contains. Do not interpret or judge the content.
+
+Return ONLY a JSON object:
+{
+  "readable": true if you can read a post or message in the image, otherwise false,
+  "platform": the platform it appears to come from, or "unknown",
+  "author": the account, page or sender name exactly as shown, or null,
+  "post_text": the main post's text, word for word, in its original language. Leave out comments, buttons, counters and interface labels. Empty string if there is none,
+  "image_description": if the post includes a photo, meme, cartoon or graphic — describe in English what it shows; quote any text inside it word for word and add an English translation. null if there is none,
+  "also_visible": a shared or quoted post, headline or link preview that is part of the post, word for word, or null
+}`;
+  const response = await claudeFetch(ANTHROPIC_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: getModel('vision'), max_tokens: 3000, temperature: 0,
+      messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } }, { type: 'text', text: prompt }] }]
+    })
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error('Claude API error: ' + ((err.error && err.error.message) || response.status));
+  }
+  const data = await response.json();
+  const raw = (data.content || []).filter(c => c.type === 'text').map(c => c.text || '').join('');
+  const read = extractJSON(raw);
+  read._tokens = { input: (data.usage && data.usage.input_tokens) || 0, output: (data.usage && data.usage.output_tokens) || 0 };
+  return read;
+}
+
+function buildScreenshotAnalysisText(read) {
+  const parts = ['[CONTEXT FOR ANALYSIS: The content below was read automatically from an image the user uploaded — usually a screenshot of a social media post. It may contain small reading errors. Comments and interface elements were left out.]'];
+  if (read.platform && read.platform !== 'unknown') parts.push('Platform: ' + read.platform);
+  if (read.author) parts.push('Account: ' + read.author);
+  if (read.post_text) parts.push('Post text: ' + read.post_text);
+  if (read.image_description) parts.push('Image in the post: ' + read.image_description);
+  if (read.also_visible) parts.push('Also part of the post: ' + read.also_visible);
+  return parts.join('\n\n');
+}
+
 const ALT_ROUTE_KAN_BASE = process.env.ALT_ROUTE_KAN_BASE || 'https://mobapi.kan.org.il';   // test hook
 // Known alternate routes: same content, served from an address without bot protection.
 const ALT_ROUTES = [
@@ -2896,6 +3112,8 @@ async function fetchFromX(url) {
 // Falls back to manual text if fetch is too short.
 // ─────────────────────────────────────────────
 async function fetchFromInstagram(url) {
+  const embedded = await fetchInstagramEmbed(url);
+  if (embedded) return embedded;
   return await scrapeOpenGraph(url, 'instagram');
 }
 
@@ -2905,7 +3123,10 @@ async function fetchFromInstagram(url) {
 // posts/pages via og:description meta tag.
 // ─────────────────────────────────────────────
 async function fetchFromFacebook(url) {
-  // Try OpenGraph first
+  // Embed page first — built to be loaded without a login
+  const embedded = await fetchFacebookEmbed(url);
+  if (embedded && embedded.text.length >= 30) return embedded;
+  // Then OpenGraph
   try {
     const result = await scrapeOpenGraph(url, 'facebook');
     if (result && result.text && result.text.length >= 100) return result;
