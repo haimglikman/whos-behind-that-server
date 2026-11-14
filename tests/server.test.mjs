@@ -4,7 +4,7 @@ import { test, describe, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { ROOT, SERVER_VERSION, KEYS, needs, state, reset, start, stop, ctx, get, post, SMALL, LARGE } from './helpers.mjs';
+import { ROOT, SERVER_VERSION, KEYS, needs, state, reset, start, stop, ctx, get, post, SMALL, LARGE, PIXEL_PNG, VISION_READ } from './helpers.mjs';
 
 before(start);
 after(stop);
@@ -107,6 +107,66 @@ describe('Telegram', () => {
     const r = await scan('https://t.me/c/1234567/89');
     assert.ok(r.status >= 400);
     assert.match(r.data.error, /private/i);
+  });
+});
+
+describe('Facebook and Instagram', () => {
+  test('an Instagram post is read from its embed page, with caption and account', { skip: needs('2.10.0') }, async () => {
+    const r = await scan('https://www.instagram.com/p/IGTEST1/');
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.match(r.data.post.text, /Caption line one[\s\S]*Caption line two/);
+    assert.equal(r.data.post.author, 'test.account');
+    assert.match(ctx.log, /\[META\] instagram embed p\/IGTEST1: HTTP 200.*layer=json/);
+  });
+
+  test('an Instagram login wall is recognized and logged, not read as the post', { skip: needs('2.10.0'), timeout: 60000 }, async () => {
+    await scan('https://www.instagram.com/p/IGWALL/');
+    assert.match(ctx.log, /\[META\] instagram embed p\/IGWALL: .*login wall/);
+  });
+
+  test('a Facebook post is read from the embed plugin, including text hidden in comments', { skip: needs('2.10.0') }, async () => {
+    const r = await scan('https://www.facebook.com/testpage/posts/123456');
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.match(r.data.post.text, /paragraph one about the election[\s\S]*Paragraph two/);
+    assert.equal(r.data.post.author, 'Test Page');
+    assert.ok(state.site.some(p => p.startsWith('/plugins/post.php?href=')), 'the plugin page was requested');
+  });
+});
+
+describe('Screenshot analysis', () => {
+  const upload = (body, o) => post('/analyze-image', Object.assign({ image: PIXEL_PNG, mediaType: 'image/png', entities: SMALL }, body), o);
+
+  test('a screenshot is read by Claude, then screened and judged like any post', { skip: needs('2.10.0') }, async () => {
+    const r = await upload({});
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.equal(r.data.platform, 'screenshot');
+    assert.equal(r.data.post.fromImage, true);
+    assert.equal(r.data.post.author, VISION_READ.author);
+    assert.match(r.data.post.text, /Text read from the screenshot[\s\S]*cartoon of a ballot box/);
+    assert.ok(r.data.models && r.data.models.vision, 'the vision model is reported');
+    const read = state.claude.find(c => c.prompt.includes('uploaded this image'));
+    assert.ok(read && read.prompt.includes('"type":"image"'), 'the image itself was sent to Claude');
+    assert.ok(state.claude.some(c => c.tools && c.tools[0].name === 'record_alignment'), 'the judge ran');
+  });
+
+  test('bad uploads are refused with a clear reason', { skip: needs('2.10.0') }, async () => {
+    assert.equal((await upload({ image: '' })).status, 400);
+    assert.equal((await upload({ mediaType: 'application/pdf' })).status, 400);
+    assert.equal((await upload({ entities: [] })).status, 400);
+    assert.equal((await upload({ image: 'A'.repeat(1800001) })).status, 413);
+  });
+
+  test('an image with no readable post gets a 422 and is not judged', { skip: needs('2.10.0') }, async () => {
+    state.vision = { readable: false, post_text: '', image_description: null };
+    const before = state.claude.length;
+    const r = await upload({});
+    assert.equal(r.status, 422);
+    assert.ok(!state.claude.slice(before).some(c => c.tools), 'nothing was judged');
+  });
+
+  test('uploads count toward the daily scan quota', { skip: needs('2.10.0') }, () => {
+    const src = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
+    assert.match(src, /scan:\s*\{\s*paths:\s*\[[^\]]*'\/analyze-image'/);
   });
 });
 

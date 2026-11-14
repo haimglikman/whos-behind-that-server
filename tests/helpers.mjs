@@ -35,9 +35,10 @@ export const state = {
   rejections: { temperature: 0, forcedTool: 0 },
   judge: null,           // (candidates, others) => matches[]   (candidates/others: [{id, name}])
   jevScore: null,        // (kind, entityName) => 0..1          (kind: 'm' | 'a' | 'p')
-  jevFail: false
+  jevFail: false,
+  vision: null          // the reading "Claude" returns for an uploaded image (null = a readable post)
 };
-export function reset() { state.judge = null; state.jevScore = null; state.jevFail = false; }
+export function reset() { state.judge = null; state.jevScore = null; state.jevFail = false; state.vision = null; }
 
 const para = t => `<p>${t} This sentence pads the paragraph so the article extractor accepts it as real content.</p>`;
 export const article = title => `<!DOCTYPE html><html><head><meta property="og:title" content="${title}"></head><body><article>${para('First paragraph.')}${para('Second paragraph.')}${para('Third paragraph.')}</article></body></html>`;
@@ -45,6 +46,14 @@ const CLOUDFLARE = '<!DOCTYPE html><html><head><title>Just a moment...</title></
 const TG_TEXT = 'First line of the post<br/>Second line of the post, long enough to analyze properly.';
 const tgPage = `<!DOCTYPE html><html><head><meta property="og:title" content="Test Channel"><meta property="og:description" content="First line of the post Second line of the post, long enough to analyze properly."><meta property="og:image" content="https://cdn.example/img.jpg"></head><body></body></html>`;
 const tgEmbed = `<!DOCTYPE html><html><body><div class="tgme_widget_message" data-post="testchannel/42"><a class="tgme_widget_message_owner_name"><span>Test Channel</span></a><div class="tgme_widget_message_text">${TG_TEXT}</div><span class="tgme_widget_message_views">12.3K</span><time datetime="2026-10-01T10:00:00+00:00">10:00</time></div></body></html>`;
+
+// Instagram's embed page carries the post as escaped JSON; Facebook's plugin page hides its markup inside an HTML comment
+const IG_CAPTION = 'Caption line one about the coalition\nCaption line two, long enough to analyze properly.';
+const igEmbed = `<!DOCTYPE html><html><body><script>window.__x = {"contextJSON":${JSON.stringify(JSON.stringify({ context: { media: { owner: { username: 'test.account' }, display_url: 'https://cdn.example/ig.jpg', edge_media_to_caption: { edges: [{ node: { text: IG_CAPTION } }] } } } }))}};</script></body></html>`;
+const igLogin = '<!DOCTYPE html><html><head><title>Login • Instagram</title></head><body></body></html>';
+const fbPlugin = `<!DOCTYPE html><html><body><code><!-- <div><h5><a href="#">Test Page</a></h5><div data-testid="post_message"><p>Facebook post paragraph one about the election.</p><p>Paragraph two, long enough to analyze properly.</p></div></div> --></code></body></html>`;
+export const VISION_READ = { readable: true, platform: 'Facebook', author: 'Screenshot Author', post_text: 'Text read from the screenshot, long enough to analyze.', image_description: 'A cartoon of a ballot box.', also_visible: null };
+export const PIXEL_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
 
 function parseEntities(block) { return [...String(block || '').matchAll(/^\[([^\]]+)\] ([^\n(]+)/gm)].map(m => ({ id: m[1], name: m[2].trim() })); }
 
@@ -69,6 +78,7 @@ function handle(req, res, body) {
         : candidates.map(c => ({ id: c.id, narrative: 5, interest: 5, mo: 5, alignment: 'none', why: '', missing: '' }));
       return json(200, { content: [{ type: 'tool_use', id: 't1', name: 'record_alignment', input: { text_ai_score: 2, text_ai_reason: 'Reads as human.', matches } }], stop_reason: 'tool_use', usage });
     }
+    if (prompt.includes('uploaded this image for narrative analysis')) return json(200, { content: [{ type: 'text', text: JSON.stringify(state.vision || VISION_READ) }], usage });
     if (prompt.includes('full English translation')) return json(200, { content: [{ type: 'text', text: JSON.stringify({ translation: 'ENGLISH TRANSLATION OF THE POST', political_context: 'Test context.' }) }], usage });
     if (prompt.includes('PAIR 1:')) { const n = (prompt.match(/PAIR \d+:/g) || []).length; return json(200, { content: [{ type: 'text', text: JSON.stringify(Array.from({ length: n }, (_, i) => ({ pair: i + 1, connected: true, connectionType: 'narrative reinforcement', strength: 'strong', reasoning: 'Same claim.' }))) }], usage }); }
     return json(200, { content: [{ type: 'text', text: '{}' }], usage });
@@ -94,6 +104,9 @@ function handle(req, res, body) {
   if (u.pathname.startsWith('/news/blocked-article')) return html(403, CLOUDFLARE, { server: 'cloudflare' });
   if (u.pathname.startsWith('/news/amp-only-article')) return amp ? html(200, article('AMP article title')) : html(403, CLOUDFLARE, { server: 'cloudflare' });
   if (u.pathname === '/content/kan-news/politics/item-1') return html(200, article('Kan article title'));
+  if (u.pathname === '/p/IGTEST1/embed/captioned/') return html(200, igEmbed);
+  if (u.pathname === '/p/IGWALL/embed/captioned/') return html(200, igLogin);
+  if (u.pathname === '/plugins/post.php') return html(200, fbPlugin);
   if (u.pathname === '/testchannel/42') return html(200, u.searchParams.get('embed') === '1' ? tgEmbed : tgPage);
   return html(404, 'not found');
 }
@@ -112,7 +125,8 @@ export async function start() {
     PATH: process.env.PATH, HOME: process.env.HOME || '', NODE_ENV: 'test', PORT: String(port),
     ANTHROPIC_API_KEY: KEYS.anthropic, ANTHROPIC_API_URL: ctx.mockBase + '/v1/messages',
     TYPESAFE_API_KEY: KEYS.jev, TYPESAFE_API_URL: ctx.mockBase + '/v1/systemone',
-    TELEGRAM_BASE_URL: ctx.mockBase, ALT_ROUTE_KAN_BASE: ctx.mockBase, ADMIN_KEY: KEYS.admin
+    TELEGRAM_BASE_URL: ctx.mockBase, ALT_ROUTE_KAN_BASE: ctx.mockBase,
+    META_IG_BASE: ctx.mockBase, META_FB_BASE: ctx.mockBase, ADMIN_KEY: KEYS.admin
   };
   child = spawn(process.execPath, ['server.js'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
   child.stdout.on('data', d => (ctx.log += d));
