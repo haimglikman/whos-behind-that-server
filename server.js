@@ -5,6 +5,19 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v2.11.0 — Facebook posts read from the post page itself:
+//             1. Logged-out visitors get the post under a "See more on
+//                Facebook" login box; the post is already in the page as data.
+//                The server reads it directly: full text, author, time, photo,
+//                and Facebook's own description of the photo. Tried before the
+//                embed, OpenGraph and web-search routes (photo pages have no
+//                OpenGraph tags, which is why those failed).
+//             2. Posts with little text (memes, graphics): the photo is
+//                downloaded and read by Claude (same reading as screenshot
+//                uploads); counted in the scan's tokens and models.
+//             3. [META] facebook page log line: status, redirect, login wall,
+//                what was found.
+//             4. Meta page requests send full browser navigation headers.
 // v2.10.0 — Facebook and Instagram:
 //             1. Embed pages tried first (Instagram /embed/captioned/, Facebook
 //                plugins/post.php and video.php) — public, no login; the
@@ -410,7 +423,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '2.10.0';
+const SERVER_VERSION = '2.11.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -1422,7 +1435,10 @@ app.post('/fetch-and-analyze', async (req, res) => {
     const analysis = await scoreWithClaude(postData.text, entities);
     const responseUrl = postData.normalizedUrl || url;
     const tokens = analysis._tokens || { input: 0, output: 0 };
-    res.json({ success: true, platform, post: postData, analysis, url: responseUrl, inputTokens: tokens.input, outputTokens: tokens.output, jevTokens: (analysis.triage && analysis.triage.tokens) || 0, models: analysis.models || null });
+    const vt = postData._visionTokens || null;   // a post photo read by Claude (v2.11.0)
+    delete postData._visionTokens;
+    const models = vt ? Object.assign({}, analysis.models || {}, { vision: getModel('vision') }) : (analysis.models || null);
+    res.json({ success: true, platform, post: postData, analysis, url: responseUrl, inputTokens: tokens.input + (vt ? vt.input : 0), outputTokens: tokens.output + (vt ? vt.output : 0), jevTokens: (analysis.triage && analysis.triage.tokens) || 0, models });
   } catch (err) {
     console.error('fetch-and-analyze error:', err.message);
     res.status(500).json({ error: err.message });
@@ -2579,7 +2595,7 @@ async function fetchMetaPage(target) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 15000);
   try {
-    const r = await globalThis.fetch(target, { headers: { 'User-Agent': META_UA, 'Accept': 'text/html,application/xhtml+xml', 'Accept-Language': 'en-US,en;q=0.9,he;q=0.8' }, redirect: 'follow', signal: ctrl.signal });
+    const r = await globalThis.fetch(target, { headers: { 'User-Agent': META_UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9,he;q=0.8', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Site': 'none', 'Upgrade-Insecure-Requests': '1' }, redirect: 'follow', signal: ctrl.signal });
     const html = await r.text().catch(() => '');
     return { status: r.status, html, finalUrl: r.url || target };
   } finally { clearTimeout(timer); }
@@ -2686,6 +2702,162 @@ async function fetchFacebookEmbed(url) {
 }
 
 // ─────────────────────────────────────────────
+// FACEBOOK PAGE DATA (v2.11.0)
+// Facebook draws a "See more on Facebook" login box over posts for logged-out
+// visitors, but the post itself is already inside the page as data: full text,
+// author, time, the photo, and Facebook's own description of the photo.
+// The server never runs the page's code, so there is no box to close — the data
+// is read directly. Photo pages carry no OpenGraph tags, which is why the
+// OpenGraph route alone failed on them.
+// ─────────────────────────────────────────────
+const FB_IMAGE_READ_BELOW = 200;          // post text shorter than this → read the photo with Claude
+const FB_IMAGE_MAX_BYTES = 1300000;       // fits IMAGE_MAX_BASE64 once encoded
+const FB_PROFILE_PICTURE = /\/t1\.30497-1\/|\/t39\.30808-1\//;   // avatars, not post photos
+
+function fbDecodeJsonString(s) {
+  try { return JSON.parse('"' + s + '"'); } catch (_) { return String(s).replace(/\\\//g, '/').replace(/\\n/g, '\n').replace(/\\"/g, '"'); }
+}
+function fbDecodeEntities(s) {
+  return String(s).replace(/&#0*39;/g, "'").replace(/&quot;/g, '"').replace(/&#(\d+);/g, (m, n) => String.fromCharCode(+n))
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+
+// Reads one string field at the top level of the JSON object that opens at html[open] ('{')
+function fbTopLevelString(html, open, field, limit) {
+  const end = Math.min(html.length, open + (limit || 60000));
+  let depth = 0;
+  for (let i = open; i < end; i++) {
+    const c = html[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (j < end && html[j] !== '"') j += html[j] === '\\' ? 2 : 1;
+      if (depth === 1 && html.slice(i + 1, j) === field && html[j + 1] === ':' && html[j + 2] === '"') {
+        let k = j + 3;
+        while (k < end && html[k] !== '"') k += html[k] === '\\' ? 2 : 1;
+        return fbDecodeJsonString(html.slice(j + 3, k));
+      }
+      i = j;
+    } else if (c === '{' || c === '[') depth++;
+    else if (c === '}' || c === ']') { depth--; if (depth <= 0) return null; }
+  }
+  return null;
+}
+
+function parseFacebookPage(html) {
+  const out = { text: '', author: null, publishedAt: null, image: null, imageCaption: null, postUrl: null, layer: null };
+  // Short preview Facebook puts in a plain description tag — used to pick the right data block
+  const dm = html.match(/<meta name="description" content="([^"]*)"/i);
+  const preview = dm ? fbDecodeEntities(dm[1]).replace(/(\.\.\.|…)\s*$/, '').trim() : '';
+
+  // Full post text: "message":{… "text":"…"} (and message_preferred_body)
+  const candidates = [];
+  const re = /"message(?:_preferred_body)?":\{/g;
+  let m;
+  while ((m = re.exec(html)) && candidates.length < 40) {
+    const t = fbTopLevelString(html, m.index + m[0].length - 1, 'text');
+    if (t && t.trim().length >= 2) candidates.push(t.trim());
+  }
+  const head = preview.slice(0, 40);
+  const match = head ? candidates.find(t => t.startsWith(head)) : null;
+  if (match) { out.text = match; out.layer = 'data'; }
+  else if (candidates.length && !head) { out.text = candidates[0]; out.layer = 'data'; }
+  else if (preview) { out.text = preview; out.layer = 'description'; }
+
+  // Author
+  const am = html.match(/"owner":\{"__typename":"(?:User|Page)","name":"((?:[^"\\]|\\.)*)"/) ||
+             html.match(/"actors":\[\{"__typename":"(?:User|Page)","name":"((?:[^"\\]|\\.)*)"/);
+  if (am) out.author = fbDecodeJsonString(am[1]);
+
+  // Time
+  const tm = html.match(/"(?:created_time|creation_time|publish_time)":(\d{9,11})\b/);
+  if (tm) out.publishedAt = new Date(Number(tm[1]) * 1000).toISOString();
+
+  // The photo and Facebook's own description of it ("May be an image of text that says …")
+  const cm = html.match(/"accessibility_caption":"((?:[^"\\]|\\.)*)"/);
+  if (cm) out.imageCaption = fbDecodeJsonString(cm[1]);
+  const imgRe = /"image":\{"uri":"((?:[^"\\]|\\.)*)"/g;
+  let best = null, im;
+  while ((im = imgRe.exec(html))) {
+    const uri = fbDecodeJsonString(im[1]);
+    if (FB_PROFILE_PICTURE.test(uri)) continue;
+    if (!best) best = uri;
+    if (cm && im.index < cm.index && cm.index - im.index < 4000) best = uri;   // the photo the caption describes
+  }
+  out.image = best;
+
+  const um = html.match(/"url":"(https:\\\/\\\/www\.facebook\.com\\\/[^"]+?\\\/posts\\\/[^"]+)"/);
+  if (um) out.postUrl = fbDecodeJsonString(um[1]);
+  return out;
+}
+
+async function fetchFacebookPage(url) {
+  try {
+    const u = new URL(url);
+    const page = await fetchMetaPage(META_FB_BASE + u.pathname + u.search);
+    const p = page.status === 200 ? parseFacebookPage(page.html) : parseFacebookPage('');
+    const walled = !p.text && !p.imageCaption && !p.image && /login_form|id="loginform"|<title>\s*Log (?:in|into) (?:to )?Facebook/i.test(page.html);
+    let finalPath = '';
+    try { finalPath = new URL(page.finalUrl).pathname; } catch (_) {}
+    console.log(`[META] facebook page: HTTP ${page.status}, ${Math.round(page.html.length / 1024)} KB${finalPath && finalPath !== u.pathname ? ' → ' + finalPath : ''}${walled ? ', login wall' : ''} | text=${p.text.length} chars (${p.layer || 'none'}) | author=${p.author || '-'} | photo=${p.image ? 'yes' : 'no'} | fb-caption=${p.imageCaption ? 'yes' : 'no'}`);
+    if (!p.text && !p.image && !p.imageCaption) return null;
+    return p;
+  } catch (e) {
+    console.log('[META] facebook page failed:', e.message);
+    return null;
+  }
+}
+
+// Downloads a post's photo and has Claude read it (same reading as an uploaded screenshot)
+async function readPostImage(imageUrl, platformLabel) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const r = await globalThis.fetch(imageUrl, { headers: { 'User-Agent': META_UA, 'Accept': 'image/*' }, signal: ctrl.signal });
+    if (!r.ok) { console.log(`[META] photo download: HTTP ${r.status}`); return null; }
+    const type = String(r.headers.get('content-type') || 'image/jpeg').split(';')[0].trim().toLowerCase();
+    if (!IMAGE_TYPES.includes(type)) { console.log('[META] photo download: unsupported type', type); return null; }
+    const buf = Buffer.from(await r.arrayBuffer());
+    if (buf.length > FB_IMAGE_MAX_BYTES) { console.log(`[META] photo too large to read (${Math.round(buf.length / 1024)} KB)`); return null; }
+    const read = await readScreenshot(buf.toString('base64'), type, platformLabel);
+    console.log(`[META] photo read by Claude: ${String(read.post_text || '').length} chars of text${read.image_description ? ' + description' : ''} | model=${getModel('vision')}`);
+    return read;
+  } catch (e) {
+    console.log('[META] photo read failed:', e.message);
+    return null;
+  } finally { clearTimeout(timer); }
+}
+
+function buildFacebookPostText(p, read) {
+  const parts = [];
+  if (p.text) parts.push(p.text);
+  if (read && (read.post_text || read.image_description)) {
+    const img = [];
+    if (read.post_text) img.push('Text in the image: ' + read.post_text);
+    if (read.image_description) img.push('What the image shows: ' + read.image_description);
+    if (read.also_visible) img.push('Also in the image: ' + read.also_visible);
+    parts.push('[IMAGE IN THE POST — read automatically; may contain small reading errors]\n' + img.join('\n'));
+  } else if (p.imageCaption) {
+    parts.push("[IMAGE IN THE POST — Facebook's own description] " + p.imageCaption);
+  }
+  return parts.join('\n\n');
+}
+
+async function fetchFacebookFromPage(url) {
+  const p = await fetchFacebookPage(url);
+  if (!p) return null;
+  let read = null;
+  if (p.image && p.text.length < FB_IMAGE_READ_BELOW) read = await readPostImage(p.image, 'Facebook');
+  const text = buildFacebookPostText(p, read);
+  if (text.length < 30) return null;
+  return {
+    text, author: p.author, authorHandle: p.author, source: 'facebook', domain: 'facebook.com',
+    ogTitle: (p.text || (read && read.post_text) || p.imageCaption || '').split('\n')[0].slice(0, 120) || null,
+    ogImage: p.image || null, publishedAt: p.publishedAt || null, canonicalUrl: p.postUrl || null,
+    imageRead: !!read, _visionTokens: read ? read._tokens : null
+  };
+}
+
+// ─────────────────────────────────────────────
 // SCREENSHOT ANALYSIS (v2.10.0) — works for anything no server can reach
 // Claude reads the uploaded image (post text, author, and what a photo or meme
 // shows); the result then goes through the normal screening and judging.
@@ -2694,8 +2866,11 @@ async function fetchFacebookEmbed(url) {
 const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 const IMAGE_MAX_BASE64 = 1800000;   // fits the 2 MB request limit; the apps downscale before sending
 
-async function readScreenshot(imageBase64, mediaType) {
-  const prompt = `A user uploaded this image for narrative analysis. It is usually a screenshot of a social media post (Facebook, Instagram, WhatsApp, X, Telegram, TikTok) or a meme. Read it carefully and report what it contains. Do not interpret or judge the content.
+async function readScreenshot(imageBase64, mediaType, postPlatform) {
+  const intro = postPlatform
+    ? `This image is the photo attached to a public ${postPlatform} post, fetched automatically for narrative analysis. It may be a meme, a graphic with text, a screenshot of another post, or a photo.`
+    : 'A user uploaded this image for narrative analysis. It is usually a screenshot of a social media post (Facebook, Instagram, WhatsApp, X, Telegram, TikTok) or a meme.';
+  const prompt = `${intro} Read it carefully and report what it contains. Do not interpret or judge the content.
 
 Return ONLY a JSON object:
 {
@@ -3123,7 +3298,10 @@ async function fetchFromInstagram(url) {
 // posts/pages via og:description meta tag.
 // ─────────────────────────────────────────────
 async function fetchFromFacebook(url) {
-  // Embed page first — built to be loaded without a login
+  // The post page itself — the post is inside it as data, under the login box (v2.11.0)
+  const fromPage = await fetchFacebookFromPage(url);
+  if (fromPage) return fromPage;
+  // Embed page — built to be loaded without a login
   const embedded = await fetchFacebookEmbed(url);
   if (embedded && embedded.text.length >= 30) return embedded;
   // Then OpenGraph

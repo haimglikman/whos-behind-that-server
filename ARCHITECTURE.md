@@ -1,6 +1,6 @@
 # Who's Behind That? — Architecture
 
-**Doc version:** 1.5.0 · Reflects server v2.10.0 · admin v2.32.0 · client v1.23.0 · chatbot v1.2.3.1
+**Doc version:** 1.6.0 · Reflects server v2.11.0 · admin v2.33.0 · client v1.24.0 · chatbot v1.2.3.1
 
 Who's Behind That? (WBT) is an AI-powered narrative alignment analysis tool. Given a social media post or news article, it identifies whose agenda the content serves — and, across multiple posts, whether they form a coordinated narrative. It focuses on the Israeli-Palestinian conflict and Israeli domestic politics, and is designed and built by a single developer.
 
@@ -55,12 +55,14 @@ Each frontend is a single self-contained HTML file with no build step. The serve
 
 1. **Fetch** — the server detects the platform from the URL and extracts text and metadata:
    - X: oEmbed · Telegram: public post page and embed widget
-   - Facebook / Instagram: Meta's public embed pages first (Instagram `/embed/captioned/`, Facebook's post and video plugins), which load without a login; a video in an Instagram embed is transcribed. Then OpenGraph scraping, and for Facebook a Claude web search. Each embed attempt is logged with what it found
+   - Facebook: logged-out visitors get a public post under a "See more on Facebook" login box, but the post is already inside the page as data. The server reads it directly — full text, author, time, photo, and Facebook's own description of the photo. When a post has little text (memes, graphics), its photo is downloaded and read by Claude. Then the embed plugin, OpenGraph and a Claude web search as fallbacks
+   - Instagram: the public embed page first (`/embed/captioned/`), which loads without a login; a video in the embed is transcribed. Then OpenGraph scraping
+   - Every Meta attempt is logged with what it found (`[META]`)
    - News: basic headers → full browser-like headers → the page's lighter AMP version → Archive.org; any URL with a non-root path is attempted
    - Sites known to block automated reading get a per-site alternate route, tried first. The first is Kan, read through its app address (`mobapi.kan.org.il`)
    - Bot-protection pages (Cloudflare, Imperva, PerimeterX, DataDome, Radware, F5, Akamai) are recognized, so the user is told the site blocks automated reading rather than that it may be paywalled; each block is logged per domain
    - Video (YouTube, TikTok, Instagram, Facebook, X, Telegram): transcript via TranscriptAPI (YouTube) or yt-dlp audio + Groq Whisper, plus caption, hashtags and account
-   - Manual paste is always available for private or paywalled content
+   - Manual paste is always available for private or paywalled content. When a scan fails, the apps offer pasting the text or uploading a screenshot, with the link kept
    - **Screenshot upload** — for posts no server can reach (logged-in-only Facebook and Instagram posts, WhatsApp forwards, memes). The app downscales the image in the browser; Claude reads the post text, the account and what the image shows; the result then goes through steps 2–5 like any post. The image is never stored
 2. **Translate** — Hebrew and Arabic content is translated to English (Claude Haiku) before screening.
 3. **Screen (Jev)** — Jev, a classification model (TypeSafe, via OpenRouter), answers three literal questions per entity in one request: is it *mentioned*, *criticized*, *praised*? This produces a shortlist.
