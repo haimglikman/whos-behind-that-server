@@ -133,6 +133,41 @@ describe('Facebook and Instagram', () => {
   });
 });
 
+describe('Facebook post pages', () => {
+  const fb = id => 'https://www.facebook.com/photo/?fbid=' + id;
+
+  test('a public post is read from the page data under the login box: full text, author, date, photo', { skip: needs('2.11.0') }, async () => {
+    const seen = state.site.length;
+    const r = await scan(fb('1603660838468882'));
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.match(r.data.post.text, /^It's happened before, and Israeli intelligence says[\s\S]*state sponsor of terror\./);
+    assert.match(r.data.post.text, /Facebook's own description\] May be an image of text that says 'StandWithUs/);
+    assert.equal(r.data.post.author, 'StandWithUs');
+    assert.equal(r.data.post.publishedAt, '2026-09-07T12:01:56.000Z');
+    assert.equal(r.data.post.imageRead, false, 'enough text: the photo is not sent to Claude');
+    assert.match(ctx.log, /\[META\] facebook page: HTTP 200.*text=395 chars \(data\) \| author=StandWithUs \| photo=yes \| fb-caption=yes/);
+    assert.ok(!state.site.slice(seen).some(p => p.startsWith('/plugins/')), 'no need for the embed route');
+  });
+
+  test('a post with little text gets its photo read by Claude, counted in tokens and models', { skip: needs('2.11.0') }, async () => {
+    const r = await scan(fb('111'));
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.equal(r.data.post.imageRead, true);
+    assert.match(r.data.post.text, /IMAGE IN THE POST — read automatically[\s\S]*Text in the image: Text read from the screenshot/);
+    assert.ok(state.site.includes('/fbimg.png'), 'the photo was downloaded');
+    const read = state.claude.filter(c => c.prompt.includes('photo attached to a public Facebook post')).pop();
+    assert.ok(read && read.prompt.includes('"type":"image"'), 'the photo itself was sent to Claude');
+    assert.ok(r.data.models && r.data.models.vision, 'the vision model is reported');
+  });
+
+  test('a login page is recognized and logged, and the next route is tried', { skip: needs('2.11.0') }, async () => {
+    const seen = state.site.length;
+    await scan(fb('222'));
+    assert.match(ctx.log, /\[META\] facebook page: HTTP 200.*login wall \| text=0 chars/);
+    assert.ok(state.site.slice(seen).some(p => p.startsWith('/plugins/post.php')), 'fell through to the embed route');
+  });
+});
+
 describe('Screenshot analysis', () => {
   const upload = (body, o) => post('/analyze-image', Object.assign({ image: PIXEL_PNG, mediaType: 'image/png', entities: SMALL }, body), o);
 

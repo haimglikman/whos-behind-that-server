@@ -78,7 +78,7 @@ function handle(req, res, body) {
         : candidates.map(c => ({ id: c.id, narrative: 5, interest: 5, mo: 5, alignment: 'none', why: '', missing: '' }));
       return json(200, { content: [{ type: 'tool_use', id: 't1', name: 'record_alignment', input: { text_ai_score: 2, text_ai_reason: 'Reads as human.', matches } }], stop_reason: 'tool_use', usage });
     }
-    if (prompt.includes('uploaded this image for narrative analysis')) return json(200, { content: [{ type: 'text', text: JSON.stringify(state.vision || VISION_READ) }], usage });
+    if (prompt.includes('for narrative analysis')) return json(200, { content: [{ type: 'text', text: JSON.stringify(state.vision || VISION_READ) }], usage });
     if (prompt.includes('full English translation')) return json(200, { content: [{ type: 'text', text: JSON.stringify({ translation: 'ENGLISH TRANSLATION OF THE POST', political_context: 'Test context.' }) }], usage });
     if (prompt.includes('PAIR 1:')) { const n = (prompt.match(/PAIR \d+:/g) || []).length; return json(200, { content: [{ type: 'text', text: JSON.stringify(Array.from({ length: n }, (_, i) => ({ pair: i + 1, connected: true, connectionType: 'narrative reinforcement', strength: 'strong', reasoning: 'Same claim.' }))) }], usage }); }
     return json(200, { content: [{ type: 'text', text: '{}' }], usage });
@@ -107,6 +107,13 @@ function handle(req, res, body) {
   if (u.pathname === '/p/IGTEST1/embed/captioned/') return html(200, igEmbed);
   if (u.pathname === '/p/IGWALL/embed/captioned/') return html(200, igLogin);
   if (u.pathname === '/plugins/post.php') return html(200, fbPlugin);
+  if (u.pathname === '/photo/') {   // Facebook photo pages, trimmed from a real logged-out page
+    const name = { '1603660838468882': 'fb-photo', '111': 'fb-meme', '222': 'fb-login' }[u.searchParams.get('fbid')];
+    if (!name) return html(404, 'not found');
+    const page = fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', name + '.html'), 'utf8').replace(/__MOCK__/g, ctx.mockBase.replace(/\//g, '\\/'));
+    return html(200, page);
+  }
+  if (u.pathname === '/fbimg.png') { res.writeHead(200, { 'Content-Type': 'image/png' }); return res.end(Buffer.from(PIXEL_PNG, 'base64')); }
   if (u.pathname === '/testchannel/42') return html(200, u.searchParams.get('embed') === '1' ? tgEmbed : tgPage);
   return html(404, 'not found');
 }
