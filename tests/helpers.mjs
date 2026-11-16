@@ -113,6 +113,11 @@ function handle(req, res, body) {
     const page = fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', name + '.html'), 'utf8').replace(/__MOCK__/g, ctx.mockBase.replace(/\//g, '\\/'));
     return html(200, page);
   }
+  if (u.pathname === '/p/DfuW4h9jZwQ/' || u.pathname === '/p/IGLOGIN1/') {   // Instagram post pages, trimmed from a real logged-out page
+    const page = fs.readFileSync(path.join(ROOT, 'tests', 'fixtures', u.pathname.includes('IGLOGIN') ? 'ig-login.html' : 'ig-carousel.html'), 'utf8').replace(/__MOCK__/g, ctx.mockBase.replace(/\//g, '\\/'));
+    return html(200, page);
+  }
+  if (u.pathname === '/igimg.png') { res.writeHead(200, { 'Content-Type': 'image/png' }); return res.end(Buffer.from(PIXEL_PNG, 'base64')); }
   if (u.pathname === '/fbimg.png') { res.writeHead(200, { 'Content-Type': 'image/png' }); return res.end(Buffer.from(PIXEL_PNG, 'base64')); }
   if (u.pathname === '/testchannel/42') return html(200, u.searchParams.get('embed') === '1' ? tgEmbed : tgPage);
   return html(404, 'not found');

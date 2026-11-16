@@ -168,6 +168,41 @@ describe('Facebook post pages', () => {
   });
 });
 
+describe('Instagram post pages', () => {
+  test('a carousel is read from the page data: full caption, account, date, and the first image read by Claude', { skip: needs('2.12.0') }, async () => {
+    const seen = state.site.length;
+    const r = await scan('https://www.instagram.com/p/DfuW4h9jZwQ/?img_index=1');
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.match(r.data.post.text, /^Their hearing aids are falling silent\.[\s\S]*بلا بطاريات/);
+    assert.match(r.data.post.text, /FIRST IMAGE OF THE CAROUSEL — read automatically[\s\S]*Text in the image: Text read from the screenshot/);
+    assert.doesNotMatch(r.data.post.text, /different post|Decoy/, 'the decoy post is ignored');
+    assert.equal(r.data.post.author, 'eye.on.palestine');
+    assert.equal(r.data.post.mediaType, 'carousel');
+    assert.equal(r.data.post.publishedAt, '2026-11-14T13:52:56.000Z');
+    assert.equal(r.data.post.imageRead, true);
+    assert.ok(state.site.slice(seen).includes('/igimg.png'), 'the first image was downloaded');
+    assert.ok(state.claude.some(c => c.prompt.includes('photo attached to a public Instagram post')), 'Claude read the image');
+    assert.ok(r.data.models && r.data.models.vision, 'the vision model is reported');
+    assert.match(ctx.log, /\[META\] instagram page p\/DfuW4h9jZwQ: HTTP 200.*type=carousel \| caption=809 chars \(data\) \| account=eye\.on\.palestine \| image=yes/);
+    assert.ok(!state.site.slice(seen).some(p => p.includes('/embed/')), 'no need for the embed route');
+  });
+
+  test("if Claude can't read the image, Instagram's own description is used", { skip: needs('2.12.0') }, async () => {
+    state.vision = { readable: false, post_text: '', image_description: null };
+    const r = await scan('https://www.instagram.com/p/DfuW4h9jZwQ/');
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.match(r.data.post.text, /Instagram's own description\] Photo by .* May be an image of poster and text\./);
+    assert.equal(r.data.post.imageRead, false);
+  });
+
+  test('an Instagram login page is recognized and logged, and the embed route is tried', { skip: needs('2.12.0') }, async () => {
+    const seen = state.site.length;
+    await scan('https://www.instagram.com/p/IGLOGIN1/');
+    assert.match(ctx.log, /\[META\] instagram page p\/IGLOGIN1: HTTP 200.*login wall/);
+    assert.ok(state.site.slice(seen).includes('/p/IGLOGIN1/embed/captioned/'), 'fell through to the embed route');
+  });
+});
+
 describe('Screenshot analysis', () => {
   const upload = (body, o) => post('/analyze-image', Object.assign({ image: PIXEL_PNG, mediaType: 'image/png', entities: SMALL }, body), o);
 
