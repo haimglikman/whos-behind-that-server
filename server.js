@@ -5,6 +5,17 @@
 // ─────────────────────────────────────────────
 // CHANGELOG
 // ─────────────────────────────────────────────
+// v2.12.0 — Instagram: caption + image, combined:
+//             1. Posts read from the normal post page, which carries the post
+//                as data for logged-out visitors: full caption, account, time,
+//                type and images. The main post is found by its code (the page
+//                also lists other posts). Tried before the embed and OpenGraph.
+//             2. The main image (for a carousel, the first one) is always read
+//                by Claude; Instagram's own image description is the fallback.
+//             3. Reels: after the transcript, the cover frame is read too.
+//             4. [META] instagram page log line.
+//             5. Fix (Facebook too): a photo Claude couldn't read is no longer
+//                flagged as read; the tokens spent on it are still counted.
 // v2.11.0 — Facebook posts read from the post page itself:
 //             1. Logged-out visitors get the post under a "See more on
 //                Facebook" login box; the post is already in the page as data.
@@ -423,7 +434,7 @@
 // v1.1.0  — Initial deployment: Express, CORS, health check, Anthropic key.
 // ─────────────────────────────────────────────
 
-const SERVER_VERSION = '2.11.0';
+const SERVER_VERSION = '2.12.0';
 
 import express from 'express';
 import cors from 'cors';
@@ -1412,6 +1423,15 @@ app.post('/fetch-and-analyze', async (req, res) => {
           ogTitle: video.title || (video.caption ? video.caption.slice(0, 120) : null),
           ogImage: video.thumbnail
         };
+        // Instagram: the cover frame usually carries the headline — read it too (v2.12.0)
+        if (platform === 'instagram' && video.thumbnail) {
+          const cover = await readPostImage(video.thumbnail, 'Instagram');
+          if (cover && (cover.post_text || cover.image_description)) {
+            postData.text += '\n\n' + buildInstagramPostText({ caption: '' }, cover, 'VIDEO COVER');
+            postData.imageRead = true;
+            postData._visionTokens = cover._tokens;
+          }
+        }
       }
     }
 
@@ -2853,7 +2873,104 @@ async function fetchFacebookFromPage(url) {
     text, author: p.author, authorHandle: p.author, source: 'facebook', domain: 'facebook.com',
     ogTitle: (p.text || (read && read.post_text) || p.imageCaption || '').split('\n')[0].slice(0, 120) || null,
     ogImage: p.image || null, publishedAt: p.publishedAt || null, canonicalUrl: p.postUrl || null,
-    imageRead: !!read, _visionTokens: read ? read._tokens : null
+    imageRead: !!(read && (read.post_text || read.image_description)), _visionTokens: read ? read._tokens : null
+  };
+}
+
+// ─────────────────────────────────────────────
+// INSTAGRAM POST PAGE (v2.12.0)
+// The normal post page carries the post as data for logged-out visitors: full
+// caption, account, time, type (photo / video / carousel) and the images, each
+// with Instagram's own description. The page also lists other posts (more from
+// the account, suggestions), so the main post is found by its code + taken_at.
+// Instagram analysis = caption + the main image (for a carousel, the first one),
+// always read by Claude; Instagram's description is the fallback.
+// ─────────────────────────────────────────────
+function parseInstagramPage(html, code) {
+  const out = { caption: '', username: null, fullName: null, publishedAt: null, mediaType: null, image: null, imageCaption: null, layer: null };
+  // Account and a short caption from the preview tags: "5,340 likes, 48 comments - user on November 14, 2026: "…""
+  const dm = html.match(/<meta (?:property="og:description"|name="description") content="([^"]*)"/i);
+  const preview = dm ? fbDecodeEntities(dm[1]) : '';
+  const um = preview.match(/ - ([A-Za-z0-9._]+) on [A-Z][a-z]+ \d{1,2}, \d{4}/);
+  if (um) out.username = um[1];
+
+  const main = code ? html.match(new RegExp('"code":"' + code.replace(/[^A-Za-z0-9_-]/g, '') + '","taken_at":(\\d{9,11})')) : null;
+  if (main) {
+    const at = main.index;
+    out.publishedAt = new Date(Number(main[1]) * 1000).toISOString();
+    const next = html.slice(at + 20).search(/"code":"[A-Za-z0-9_-]+","taken_at":/);
+    const end = next >= 0 ? at + 20 + next : Math.min(html.length, at + 60000);
+    const win = html.slice(at, end);
+    const mt = win.match(/"media_type":(\d)/);
+    if (mt) out.mediaType = ({ 1: 'photo', 2: 'video', 8: 'carousel' })[mt[1]] || mt[1];
+    const ci = win.indexOf('"caption":{');
+    if (ci >= 0) { const t = fbTopLevelString(html, at + ci + 10, 'text'); if (t) { out.caption = t.trim(); out.layer = 'data'; } }
+    const ki = win.indexOf('"carousel_media":[');
+    const from = ki >= 0 ? ki : 0;   // a carousel: its first image
+    const im = win.slice(from).match(/"image_versions2":\{"candidates":\[\{"url":"((?:[^"\\]|\\.)*)"/);
+    if (im) out.image = fbDecodeJsonString(im[1]);
+    const ac = win.slice(from).match(/"accessibility_caption":"((?:[^"\\]|\\.)*)"/);
+    if (ac) out.imageCaption = fbDecodeJsonString(ac[1]);
+    const fn = html.slice(Math.max(0, at - 1500), at).match(/"full_name":"((?:[^"\\]|\\.)*)"(?![\s\S]*"full_name":")/);
+    if (fn) out.fullName = fbDecodeJsonString(fn[1]);
+  }
+  if (!out.caption && preview) {   // the preview tag holds a shortened caption
+    const pc = preview.match(/:\s*"([\s\S]+)"\.?\s*$/);
+    if (pc) { out.caption = pc[1].trim(); out.layer = 'description'; }
+  }
+  if (!out.image) {
+    const og = html.match(/<meta property="og:image" content="([^"]+)"/i);
+    if (og) out.image = fbDecodeEntities(og[1]);
+  }
+  return out;
+}
+
+async function fetchInstagramPage(url) {
+  const ref = instagramPostRef(url);
+  if (!ref) return null;
+  try {
+    const page = await fetchMetaPage(`${META_IG_BASE}/${ref.kind === 'reel' ? 'reel' : ref.kind}/${ref.code}/`);
+    const p = page.status === 200 ? parseInstagramPage(page.html, ref.code) : parseInstagramPage('', null);
+    const walled = !p.caption && !p.image && /accounts\/login|"loginPage"|<title>\s*Login/i.test(page.html.slice(0, 300000));
+    let finalPath = '';
+    try { finalPath = new URL(page.finalUrl).pathname; } catch (_) {}
+    console.log(`[META] instagram page ${ref.kind}/${ref.code}: HTTP ${page.status}, ${Math.round(page.html.length / 1024)} KB${finalPath && !finalPath.includes(ref.code) ? ' → ' + finalPath : ''}${walled ? ', login wall' : ''} | type=${p.mediaType || '?'} | caption=${p.caption.length} chars (${p.layer || 'none'}) | account=${p.username || '-'} | image=${p.image ? 'yes' : 'no'}`);
+    if (!p.caption && !p.image) return null;
+    return p;
+  } catch (e) {
+    console.log('[META] instagram page failed:', e.message);
+    return null;
+  }
+}
+
+function buildInstagramPostText(p, read, label) {
+  const parts = [];
+  if (p.caption) parts.push(p.caption);
+  if (read && (read.post_text || read.image_description)) {
+    const img = [];
+    if (read.post_text) img.push('Text in the image: ' + read.post_text);
+    if (read.image_description) img.push('What the image shows: ' + read.image_description);
+    if (read.also_visible) img.push('Also in the image: ' + read.also_visible);
+    parts.push(`[${label} — read automatically; may contain small reading errors]\n` + img.join('\n'));
+  } else if (p.imageCaption) {
+    parts.push(`[${label} — Instagram's own description] ` + p.imageCaption);
+  }
+  return parts.join('\n\n');
+}
+
+async function fetchInstagramFromPage(url) {
+  const p = await fetchInstagramPage(url);
+  if (!p) return null;
+  const read = p.image ? await readPostImage(p.image, 'Instagram') : null;
+  const label = p.mediaType === 'carousel' ? 'FIRST IMAGE OF THE CAROUSEL' : p.mediaType === 'video' ? 'VIDEO COVER' : 'IMAGE IN THE POST';
+  const text = buildInstagramPostText(p, read, label);
+  if (text.length < 30) return null;
+  return {
+    text, author: p.username || p.fullName, authorHandle: p.username, authorName: p.fullName || null,
+    source: 'instagram', domain: 'instagram.com', mediaType: p.mediaType || null,
+    ogTitle: (p.caption || (read && read.post_text) || '').split('\n')[0].slice(0, 120) || null,
+    ogImage: p.image || null, publishedAt: p.publishedAt || null,
+    imageRead: !!(read && (read.post_text || read.image_description)), _visionTokens: read ? read._tokens : null
   };
 }
 
@@ -3287,6 +3404,9 @@ async function fetchFromX(url) {
 // Falls back to manual text if fetch is too short.
 // ─────────────────────────────────────────────
 async function fetchFromInstagram(url) {
+  // The post page itself: caption + main image, read by Claude (v2.12.0)
+  const fromPage = await fetchInstagramFromPage(url);
+  if (fromPage) return fromPage;
   const embedded = await fetchInstagramEmbed(url);
   if (embedded) return embedded;
   return await scrapeOpenGraph(url, 'instagram');

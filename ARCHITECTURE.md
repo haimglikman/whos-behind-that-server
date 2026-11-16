@@ -1,6 +1,6 @@
 # Who's Behind That? — Architecture
 
-**Doc version:** 1.6.0 · Reflects server v2.11.0 · admin v2.33.0 · client v1.24.0 · chatbot v1.2.3.1
+**Doc version:** 1.7.0 · Reflects server v2.12.0 · admin v2.33.0 · client v1.24.0 · chatbot v1.2.3.1
 
 Who's Behind That? (WBT) is an AI-powered narrative alignment analysis tool. Given a social media post or news article, it identifies whose agenda the content serves — and, across multiple posts, whether they form a coordinated narrative. It focuses on the Israeli-Palestinian conflict and Israeli domestic politics, and is designed and built by a single developer.
 
@@ -56,7 +56,7 @@ Each frontend is a single self-contained HTML file with no build step. The serve
 1. **Fetch** — the server detects the platform from the URL and extracts text and metadata:
    - X: oEmbed · Telegram: public post page and embed widget
    - Facebook: logged-out visitors get a public post under a "See more on Facebook" login box, but the post is already inside the page as data. The server reads it directly — full text, author, time, photo, and Facebook's own description of the photo. When a post has little text (memes, graphics), its photo is downloaded and read by Claude. Then the embed plugin, OpenGraph and a Claude web search as fallbacks
-   - Instagram: the public embed page first (`/embed/captioned/`), which loads without a login; a video in the embed is transcribed. Then OpenGraph scraping
+   - Instagram: caption + image, combined. The normal post page carries the post as data for logged-out visitors (full caption, account, time, type, images); the main post is found by its code, since the page also lists other posts. The main image — for a carousel, the first one — is always read by Claude, with Instagram's own image description as the fallback. Reels: transcript + caption + the cover frame read by Claude. Then the embed page and OpenGraph as fallbacks
    - Every Meta attempt is logged with what it found (`[META]`)
    - News: basic headers → full browser-like headers → the page's lighter AMP version → Archive.org; any URL with a non-root path is attempted
    - Sites known to block automated reading get a per-site alternate route, tried first. The first is Kan, read through its app address (`mobapi.kan.org.il`)

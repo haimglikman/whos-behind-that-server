@@ -1,5 +1,14 @@
 # Who's Behind That? — Server Changelog
 
+### v2.12.0 (server) | Admin: v2.33.0 | Client: v1.24.0 | Chatbot: v1.2.3.1
+- Instagram: caption + image, combined. Posts are read from the normal post page, which carries the post as data for logged-out visitors: full caption, account, time, type and images. The main post is found by its code (the page also lists other posts). Tried before the embed and OpenGraph routes
+- The main image (for a carousel, the first one) is always read by Claude; Instagram's own image description is the fallback
+- Reels: after the transcript, the cover frame is read by Claude too
+- New [META] instagram page log line: status, login wall, type, caption length, account, image
+- Fix (Facebook too): a photo Claude couldn't read is no longer flagged as read; the tokens spent on it are still counted
+- Tests: 3 new tests built from a real logged-out Instagram carousel page (36 in total)
+- ARCHITECTURE.md updated (doc v1.7.0)
+
 ### v2.11.0 (server) | Admin: v2.33.0 | Client: v1.24.0 | Chatbot: v1.2.3.1
 - Facebook: public posts are read from the post page itself. Logged-out visitors get the post under a "See more on Facebook" login box, but the post is already in the page as data; the server reads the full text, author, time, photo and Facebook's own description of the photo. Tried before the embed, OpenGraph and web-search routes (photo pages carry no OpenGraph tags, which is why those failed)
 - Posts with little text (memes, graphics): the photo is downloaded and read by Claude, the same reading as screenshot uploads; counted in the scan's tokens and models
